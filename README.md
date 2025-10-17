@@ -1,4 +1,4 @@
-# Permaweb Capture - Backend
+# Turbo Capture Service
 
 Screenshot capture service using Puppeteer with stealth mode for bot detection evasion.
 
