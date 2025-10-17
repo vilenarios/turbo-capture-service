@@ -40,7 +40,7 @@ COPY package*.json ./
 # Install dependencies
 RUN npm ci --only=production
 
-# Install Chrome for Puppeteer
+# Install Chrome for Puppeteer (downloads to /root/.cache/puppeteer by default)
 RUN npx puppeteer browsers install chrome
 
 # Stage 2: Production stage
@@ -82,8 +82,8 @@ WORKDIR /app
 # Copy dependencies from build stage
 COPY --from=build /app/node_modules ./node_modules
 
-# Copy Chrome installation from build stage
-COPY --from=build --chown=pptruser:pptruser /home/pptruser/.cache/puppeteer /home/pptruser/.cache/puppeteer
+# Copy Chrome installation from build stage (from root's cache to pptruser's cache)
+COPY --from=build --chown=pptruser:pptruser /root/.cache/puppeteer /home/pptruser/.cache/puppeteer
 
 # Copy application files
 COPY --chown=pptruser:pptruser . .
