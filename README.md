@@ -247,6 +247,9 @@ cd turbo-capture-service
 # Install dependencies
 npm install
 
+# IMPORTANT: Install Chrome for Puppeteer
+npx puppeteer browsers install chrome
+
 # Create .env file
 cp .env.example .env
 nano .env  # Edit with your settings
@@ -260,6 +263,11 @@ pm2 start server.js --name turbo-capture
 pm2 save
 pm2 startup  # Follow instructions to enable auto-start
 ```
+
+**Important Notes:**
+- **Chrome Installation**: When running without Docker, you MUST install Chrome with `npx puppeteer browsers install chrome`
+- **Docker Users**: If using Docker, Chrome is automatically installed during the build process
+- **System Requirements**: Minimum 512MB RAM, recommended 2GB+ for Chrome
 
 #### 2. Configure Nginx
 
@@ -286,15 +294,9 @@ location /local/capture/ {
     proxy_send_timeout 120s;
     proxy_read_timeout 120s;
 
-    # Handle CORS (backend already sends CORS headers, but we can reinforce)
-    add_header Access-Control-Allow-Origin $http_origin always;
-    add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
-    add_header Access-Control-Allow-Headers "Content-Type" always;
-
-    # Handle preflight requests
-    if ($request_method = 'OPTIONS') {
-        return 204;
-    }
+    # IMPORTANT: Do NOT add CORS headers here!
+    # The backend already handles CORS properly via the ALLOWED_ORIGINS env var.
+    # Adding headers here will cause duplicate header errors.
 }
 
 # Your existing ar.io gateway routing
