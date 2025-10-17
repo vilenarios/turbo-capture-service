@@ -16,11 +16,12 @@ puppeteer.use(StealthPlugin());
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const VERSION = '1.0.0';
+const VERSION = '0.0.1';
 
 // Server statistics
 const startTime = Date.now();
 let captureCount = 0;
+let totalBytesCaptured = 0;
 
 // Security: Helmet for HTTP headers
 app.use(helmet());
@@ -59,11 +60,22 @@ app.get('/health', (req, res) => {
   const minutes = Math.floor((uptimeSeconds % 3600) / 60);
   const seconds = uptimeSeconds % 60;
 
+  // Format bytes for human-readable display
+  const formatBytes = (bytes) => {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i];
+  };
+
   res.json({
     status: 'ok',
     service: 'turbo-capture',
     version: VERSION,
     captures: captureCount,
+    totalBytes: totalBytesCaptured,
+    totalBytesFormatted: formatBytes(totalBytesCaptured),
     uptime: `${hours}h ${minutes}m ${seconds}s`,
     uptimeSeconds
   });
@@ -184,8 +196,9 @@ app.post('/screenshot', async (req, res) => {
 
     const screenshotSize = screenshot.length;
 
-    // Increment capture counter
+    // Increment capture counter and total bytes
     captureCount++;
+    totalBytesCaptured += screenshotSize;
 
     console.log(`[Puppeteer] Success: ${url} -> ${screenshotSize} bytes`);
 
