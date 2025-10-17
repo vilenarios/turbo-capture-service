@@ -5,7 +5,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: permaweb-capture-backend
+    container_name: turbo-capture-service
     ports:
       - "3001:3001"
     environment:
