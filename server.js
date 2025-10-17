@@ -12,6 +12,9 @@ import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 import dns from 'dns';
 import { promisify } from 'util';
+import swaggerUi from 'swagger-ui-express';
+import YAML from 'yaml';
+import fs from 'fs';
 
 const dnsResolve = promisify(dns.resolve4);
 const dnsResolve6 = promisify(dns.resolve6);
@@ -187,6 +190,17 @@ async function validateHostname(hostname) {
 
   return { valid: true };
 }
+
+// Load OpenAPI spec
+const openapiFile = fs.readFileSync('./openapi.yaml', 'utf8');
+const openapiSpec = YAML.parse(openapiFile);
+
+// API Documentation
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(openapiSpec, {
+  customSiteTitle: 'Turbo Capture API Docs',
+  customfavIcon: '/favicon.ico',
+  customCss: '.swagger-ui .topbar { display: none }'
+}));
 
 // Health check
 app.get('/health', (req, res) => {
@@ -378,6 +392,7 @@ app.post('/screenshot', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`[Puppeteer] Server running on http://localhost:${PORT}`);
+  console.log(`[Puppeteer] API Docs: http://localhost:${PORT}/api-docs`);
   console.log(`[Puppeteer] Health check: http://localhost:${PORT}/health`);
   console.log(`[Security] Rate limit: 3 requests/minute per IP`);
   console.log(`[Security] CORS origins: ${corsOptions.origin}`);

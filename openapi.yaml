@@ -1,0 +1,378 @@
+openapi: 3.0.3
+info:
+  title: Turbo Capture API
+  description: |
+    Screenshot capture service powered by Puppeteer with stealth mode for capturing websites including those with bot detection (Twitter, Instagram, etc.).
+
+    **Features:**
+    - Full-page screenshots with configurable viewport
+    - Stealth mode to bypass bot detection
+    - Rate limiting
+    - SSRF protection with DNS rebinding prevention
+    - Redirect validation
+
+    **Security:**
+    - Blocks localhost and private IP addresses
+    - DNS resolution validation
+    - Post-redirect URL validation
+    - IPv6 normalization and validation
+
+    **Perfect for:**
+    - Arweave permanent archiving
+    - Web scraping with anti-bot evasion
+    - Automated screenshot generation
+  version: 0.0.1
+  contact:
+    name: Turbo Capture Support
+    url: https://github.com/vilenarios/turbo-capture-service
+  license:
+    name: AGPL-3.0
+    url: https://www.gnu.org/licenses/agpl-3.0.html
+
+servers:
+  - url: https://vilenarios.com/local/capture
+    description: Production server (ar.io gateway)
+  - url: http://localhost:3001
+    description: Local development server
+
+tags:
+  - name: Health
+    description: Service health and monitoring
+  - name: Screenshot
+    description: Screenshot capture endpoints
+
+paths:
+  /health:
+    get:
+      tags:
+        - Health
+      summary: Health check
+      description: Get service health status, uptime, and capture statistics
+      operationId: getHealth
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+              examples:
+                healthy:
+                  summary: Healthy service
+                  value:
+                    status: ok
+                    service: turbo-capture
+                    version: 0.0.1
+                    captures: 1337
+                    totalBytes: 52428800
+                    totalBytesFormatted: "50 MB"
+                    uptime: "5h 23m 42s"
+                    uptimeSeconds: 19422
+
+  /screenshot:
+    post:
+      tags:
+        - Screenshot
+      summary: Capture screenshot
+      description: |
+        Capture a full-page screenshot of any URL using headless Chrome with stealth mode.
+
+        **Rate Limit:** 3 requests per minute per IP address
+
+        **Security:** URLs are validated to prevent SSRF attacks. Localhost, private IPs, and cloud metadata endpoints are blocked.
+
+        **Process:**
+        1. Validates URL format and hostname
+        2. Launches headless Chrome with stealth plugin
+        3. Navigates to URL and waits for network idle
+        4. Waits additional time for JavaScript/lazy loading
+        5. Validates final URL after redirects
+        6. Captures full-page screenshot
+        7. Returns base64-encoded PNG
+      operationId: captureScreenshot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScreenshotRequest'
+            examples:
+              basic:
+                summary: Basic screenshot
+                value:
+                  url: "https://example.com"
+              twitter:
+                summary: Twitter page with custom viewport
+                value:
+                  url: "https://twitter.com/elonmusk"
+                  viewportWidth: 1920
+                  viewportHeight: 1080
+                  waitFor: 15000
+              instagram:
+                summary: Instagram profile
+                value:
+                  url: "https://instagram.com/natgeo"
+                  viewportWidth: 1280
+                  viewportHeight: 800
+                  waitFor: 12000
+                  fullPage: true
+              mobile:
+                summary: Mobile viewport
+                value:
+                  url: "https://example.com"
+                  viewportWidth: 375
+                  viewportHeight: 667
+                  fullPage: false
+      responses:
+        '200':
+          description: Screenshot captured successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScreenshotResponse'
+              examples:
+                success:
+                  summary: Successful capture
+                  value:
+                    screenshot: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+                    finalUrl: "https://example.com/"
+                    title: "Example Domain"
+                    size: 245678
+                    capturedAt: "2025-10-17T14:30:00.000Z"
+                    viewport:
+                      width: 1280
+                      height: 800
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                missingUrl:
+                  summary: URL required
+                  value:
+                    error: "URL is required"
+                invalidUrl:
+                  summary: Invalid URL format
+                  value:
+                    error: "Invalid URL"
+                    message: "Please provide a valid HTTP or HTTPS URL"
+                invalidProtocol:
+                  summary: Invalid protocol
+                  value:
+                    error: "Invalid protocol"
+                    message: "Only HTTP and HTTPS URLs are allowed"
+                forbiddenUrl:
+                  summary: Forbidden URL (localhost)
+                  value:
+                    error: "Forbidden URL"
+                    message: "Localhost access not allowed"
+                privateIP:
+                  summary: Private IP blocked
+                  value:
+                    error: "Forbidden URL"
+                    message: "Private IP addresses not allowed"
+                dnsRebinding:
+                  summary: DNS rebinding detected
+                  value:
+                    error: "Forbidden URL"
+                    message: "Domain resolves to private IP address"
+                invalidViewport:
+                  summary: Invalid viewport
+                  value:
+                    error: "Invalid viewport"
+                    message: "Viewport must be between 320x240 and 3840x2160"
+                invalidWaitTime:
+                  summary: Invalid wait time
+                  value:
+                    error: "Invalid waitFor"
+                    message: "Wait time must be between 0 and 30000ms"
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                rateLimitExceeded:
+                  summary: Too many requests
+                  value:
+                    error: "Too many requests"
+                    message: "Rate limit exceeded. Maximum 3 screenshots per minute. Please try again later."
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                captureError:
+                  summary: Failed to capture
+                  value:
+                    error: "Failed to capture screenshot"
+                    message: "Navigation timeout of 30000 ms exceeded"
+                redirectBlocked:
+                  summary: Redirect to forbidden URL
+                  value:
+                    error: "Failed to capture screenshot"
+                    message: "URL redirected to a forbidden destination"
+
+components:
+  schemas:
+    ScreenshotRequest:
+      type: object
+      required:
+        - url
+      properties:
+        url:
+          type: string
+          format: uri
+          description: The URL to capture (HTTP/HTTPS only)
+          example: "https://example.com"
+          minLength: 1
+          maxLength: 2048
+        waitFor:
+          type: integer
+          description: Additional wait time in milliseconds after page load (for JavaScript execution, lazy loading)
+          default: 10000
+          minimum: 0
+          maximum: 30000
+          example: 10000
+        viewportWidth:
+          type: integer
+          description: Browser viewport width in pixels
+          default: 1280
+          minimum: 320
+          maximum: 3840
+          example: 1280
+        viewportHeight:
+          type: integer
+          description: Browser viewport height in pixels
+          default: 800
+          minimum: 240
+          maximum: 2160
+          example: 800
+        fullPage:
+          type: boolean
+          description: Capture full scrollable page (true) or just viewport (false)
+          default: true
+          example: true
+        quality:
+          type: integer
+          description: Image quality (reserved for future JPEG support, currently PNG only)
+          default: 90
+          minimum: 1
+          maximum: 100
+          example: 90
+
+    ScreenshotResponse:
+      type: object
+      required:
+        - screenshot
+        - finalUrl
+        - title
+        - size
+        - capturedAt
+        - viewport
+      properties:
+        screenshot:
+          type: string
+          format: byte
+          description: Base64-encoded PNG screenshot
+          example: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ..."
+        finalUrl:
+          type: string
+          format: uri
+          description: Final URL after any redirects
+          example: "https://example.com/"
+        title:
+          type: string
+          description: Page title from HTML <title> tag
+          example: "Example Domain"
+        size:
+          type: integer
+          description: Screenshot file size in bytes
+          example: 245678
+        capturedAt:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp of when screenshot was captured
+          example: "2025-10-17T14:30:00.000Z"
+        viewport:
+          type: object
+          description: Viewport dimensions used for capture
+          required:
+            - width
+            - height
+          properties:
+            width:
+              type: integer
+              example: 1280
+            height:
+              type: integer
+              example: 800
+
+    HealthResponse:
+      type: object
+      required:
+        - status
+        - service
+        - version
+        - captures
+        - totalBytes
+        - totalBytesFormatted
+        - uptime
+        - uptimeSeconds
+      properties:
+        status:
+          type: string
+          enum: [ok]
+          description: Service status
+          example: "ok"
+        service:
+          type: string
+          description: Service name
+          example: "turbo-capture"
+        version:
+          type: string
+          description: Service version
+          example: "0.0.1"
+        captures:
+          type: integer
+          description: Total number of screenshots captured since startup
+          example: 1337
+        totalBytes:
+          type: integer
+          description: Total bytes of screenshots captured
+          example: 52428800
+        totalBytesFormatted:
+          type: string
+          description: Human-readable total bytes
+          example: "50 MB"
+        uptime:
+          type: string
+          description: Human-readable uptime
+          example: "5h 23m 42s"
+        uptimeSeconds:
+          type: integer
+          description: Uptime in seconds
+          example: 19422
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          description: Error type
+          example: "Invalid URL"
+        message:
+          type: string
+          description: Detailed error message
+          example: "Please provide a valid HTTP or HTTPS URL"
+
+  securitySchemes: {}
+
+security: []
