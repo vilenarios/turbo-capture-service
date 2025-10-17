@@ -16,6 +16,11 @@ puppeteer.use(StealthPlugin());
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const VERSION = '1.0.0';
+
+// Server statistics
+const startTime = Date.now();
+let captureCount = 0;
 
 // Security: Helmet for HTTP headers
 app.use(helmet());
@@ -48,7 +53,20 @@ app.use('/screenshot', limiter);
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'puppeteer-screenshot' });
+  const uptimeMs = Date.now() - startTime;
+  const uptimeSeconds = Math.floor(uptimeMs / 1000);
+  const hours = Math.floor(uptimeSeconds / 3600);
+  const minutes = Math.floor((uptimeSeconds % 3600) / 60);
+  const seconds = uptimeSeconds % 60;
+
+  res.json({
+    status: 'ok',
+    service: 'turbo-capture',
+    version: VERSION,
+    captures: captureCount,
+    uptime: `${hours}h ${minutes}m ${seconds}s`,
+    uptimeSeconds
+  });
 });
 
 // Screenshot endpoint
@@ -165,6 +183,9 @@ app.post('/screenshot', async (req, res) => {
     });
 
     const screenshotSize = screenshot.length;
+
+    // Increment capture counter
+    captureCount++;
 
     console.log(`[Puppeteer] Success: ${url} -> ${screenshotSize} bytes`);
 

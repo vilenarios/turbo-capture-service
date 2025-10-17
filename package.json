@@ -1,7 +1,7 @@
 {
-  "name": "permaweb-capture-backend",
-  "version": "1.0.0",
-  "description": "Screenshot capture backend for Permaweb Capture using Puppeteer",
+  "name": "turbo-capture-service",
+  "version": "0.0.1",
+  "description": "Turbo Capture Service backend using Puppeteer",
   "type": "module",
   "main": "server.js",
   "scripts": {
@@ -12,7 +12,9 @@
     "puppeteer",
     "screenshot",
     "web-capture",
-    "arweave"
+    "arweave",
+    "turbo",
+    "ar.io"
   ],
   "author": "",
   "license": "MIT",

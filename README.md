@@ -233,6 +233,115 @@ docker stop permaweb-capture-backend
 
 ## Production Deployment
 
+### Deploying on an ar.io Gateway
+
+If you're running an ar.io gateway and want to host the capture service on the same server, you can use nginx to route requests to the backend.
+
+#### 1. Install and Start Backend
+
+```bash
+# Clone the repository
+git clone https://github.com/vilenarios/turbo-capture-service.git
+cd turbo-capture-service
+
+# Install dependencies
+npm install
+
+# Create .env file
+cp .env.example .env
+nano .env  # Edit with your settings
+
+# Start the service (use PM2 or systemd for production)
+npm start
+
+# Or use PM2 for process management
+npm install -g pm2
+pm2 start server.js --name turbo-capture
+pm2 save
+pm2 startup  # Follow instructions to enable auto-start
+```
+
+#### 2. Configure Nginx
+
+Add this location block to your nginx configuration **before** your existing `location /` block (order matters):
+
+```nginx
+# Permaweb Capture Backend Service
+location /local/capture/ {
+    # Route to backend on port 3001, stripping the /local/capture prefix
+    proxy_pass http://127.0.0.1:3001/;
+
+    # Preserve original request information
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # Required for proper HTTP/1.1 support
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+
+    # Increase timeouts for screenshot processing (can take 30-90 seconds)
+    proxy_connect_timeout 120s;
+    proxy_send_timeout 120s;
+    proxy_read_timeout 120s;
+
+    # Handle CORS (backend already sends CORS headers, but we can reinforce)
+    add_header Access-Control-Allow-Origin $http_origin always;
+    add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
+    add_header Access-Control-Allow-Headers "Content-Type" always;
+
+    # Handle preflight requests
+    if ($request_method = 'OPTIONS') {
+        return 204;
+    }
+}
+
+# Your existing ar.io gateway routing
+location / {
+    proxy_pass http://127.0.0.1:3000;
+    # ... rest of your existing config
+}
+```
+
+#### 3. Test and Reload Nginx
+
+```bash
+# Test nginx configuration
+sudo nginx -t
+
+# Reload nginx
+sudo systemctl reload nginx
+
+# Test health endpoint
+curl https://yourdomain.com/local/capture/health
+```
+
+#### 4. Update Frontend Configuration
+
+In your frontend code (`src/lib/capture/orchestrator.ts`), update the backend URLs:
+
+```typescript
+// Change from localhost to your domain
+const healthCheck = await fetch('https://yourdomain.com/local/capture/health', {
+  signal: AbortSignal.timeout(2000),
+});
+
+const screenshotResponse = await fetch('https://yourdomain.com/local/capture/screenshot', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ url, waitFor: 5000 }),
+});
+```
+
+#### How it works:
+
+- `https://yourdomain.com/local/capture/screenshot` → Routes to `http://127.0.0.1:3001/screenshot`
+- `https://yourdomain.com/local/capture/health` → Routes to `http://127.0.0.1:3001/health`
+- `https://yourdomain.com/*` → Routes to your ar.io gateway on port 3000
+
+The `/local/capture` prefix ensures no conflicts with ar.io gateway paths.
+
 ### Railway / Render / Heroku
 
 1. Connect your git repository
@@ -251,8 +360,9 @@ docker stop permaweb-capture-backend
 
 - Chrome requires significant RAM (minimum 512MB, recommend 2GB)
 - Set appropriate resource limits to prevent memory issues
-- Consider adding rate limiting to prevent abuse
-- Use a CDN or load balancer for high traffic
+- Rate limiting is already configured at 3 requests/minute per IP
+- Use PM2 or systemd for process management in production
+- Monitor logs for errors: `pm2 logs turbo-capture` or `journalctl -u turbo-capture`
 
 ## Environment Variables
 
