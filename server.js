@@ -195,22 +195,17 @@ async function validateHostname(hostname) {
 const openapiFile = fs.readFileSync('./openapi.yaml', 'utf8');
 const openapiSpec = YAML.parse(openapiFile);
 
-// API Documentation endpoint
-// Serve the OpenAPI spec as JSON
-app.get('/api-docs/openapi.json', (req, res) => {
-  res.json(openapiSpec);
-});
-
 // Swagger UI with custom options for reverse proxy compatibility
+// Using swaggerDocument directly to avoid URL-based loading issues
 const swaggerUiOptions = {
   customSiteTitle: 'Turbo Capture API Docs',
   customCss: '.swagger-ui .topbar { display: none }',
   swaggerOptions: {
-    url: './openapi.json', // Relative path to work with proxy
+    // Pass spec directly instead of URL to avoid path issues
   }
 };
 
-app.use('/api-docs', swaggerUi.serveFiles(openapiSpec, swaggerUiOptions), swaggerUi.setup(openapiSpec, swaggerUiOptions));
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(openapiSpec, swaggerUiOptions));
 
 // Health check
 app.get('/health', (req, res) => {
