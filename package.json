@@ -1,0 +1,28 @@
+{
+  "name": "permaweb-capture-backend",
+  "version": "1.0.0",
+  "description": "Screenshot capture backend for Permaweb Capture using Puppeteer",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": [
+    "puppeteer",
+    "screenshot",
+    "web-capture",
+    "arweave"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.1.0",
+    "helmet": "^8.1.0",
+    "puppeteer": "^24.25.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}
