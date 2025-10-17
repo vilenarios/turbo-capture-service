@@ -10,6 +10,11 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+import dns from 'dns';
+import { promisify } from 'util';
+
+const dnsResolve = promisify(dns.resolve4);
+const dnsResolve6 = promisify(dns.resolve6);
 
 // Use stealth plugin to evade bot detection
 puppeteer.use(StealthPlugin());
@@ -51,6 +56,137 @@ const limiter = rateLimit({
 
 // Apply rate limiting to screenshot endpoint only
 app.use('/screenshot', limiter);
+
+// Security helper functions
+function isPrivateIP(ip) {
+  // Check for localhost
+  if (ip === '127.0.0.1' || ip === 'localhost' || ip === '0.0.0.0') {
+    return true;
+  }
+
+  // Check for private IPv4 ranges
+  const parts = ip.split('.');
+  if (parts.length === 4) {
+    const first = parseInt(parts[0], 10);
+    const second = parseInt(parts[1], 10);
+
+    // 10.0.0.0/8
+    if (first === 10) return true;
+
+    // 172.16.0.0/12
+    if (first === 172 && second >= 16 && second <= 31) return true;
+
+    // 192.168.0.0/16
+    if (first === 192 && second === 168) return true;
+
+    // 169.254.0.0/16 (link-local/cloud metadata)
+    if (first === 169 && second === 254) return true;
+  }
+
+  // Check for IPv6 localhost and private addresses
+  if (ip === '::1' || ip === '::' || ip.toLowerCase().startsWith('fe80:') || ip.toLowerCase().startsWith('fc00:') || ip.toLowerCase().startsWith('fd00:')) {
+    return true;
+  }
+
+  // Check for IPv4-mapped IPv6 (::ffff:x.x.x.x)
+  if (ip.toLowerCase().includes('::ffff:')) {
+    const ipv4Part = ip.split('::ffff:')[1];
+    if (ipv4Part) {
+      return isPrivateIP(ipv4Part);
+    }
+  }
+
+  return false;
+}
+
+function normalizeIPv6(hostname) {
+  // Remove brackets if present
+  let cleaned = hostname.replace(/^\[|\]$/g, '');
+
+  // Expand :: notation to full form
+  if (cleaned.includes('::')) {
+    const sides = cleaned.split('::');
+    const left = sides[0] ? sides[0].split(':') : [];
+    const right = sides[1] ? sides[1].split(':') : [];
+    const missing = 8 - left.length - right.length;
+    const middle = Array(missing).fill('0000');
+    cleaned = [...left, ...middle, ...right].join(':');
+  }
+
+  // Pad each segment to 4 digits
+  const segments = cleaned.split(':');
+  const padded = segments.map(seg => seg.padStart(4, '0'));
+
+  return padded.join(':');
+}
+
+async function validateHostname(hostname) {
+  // Check for localhost variations
+  const localhostVariations = ['localhost', '127.0.0.1', '0.0.0.0', '::1'];
+  if (localhostVariations.includes(hostname.toLowerCase())) {
+    return { valid: false, reason: 'Localhost access not allowed' };
+  }
+
+  // Check for IPv6 localhost variations (with or without brackets)
+  const cleanedHostname = hostname.replace(/^\[|\]$/g, '');
+
+  // Normalize and check IPv6
+  if (cleanedHostname.includes(':')) {
+    try {
+      const normalized = normalizeIPv6(cleanedHostname);
+      // Check if it's localhost (0000:0000:0000:0000:0000:0000:0000:0001)
+      if (normalized === '0000:0000:0000:0000:0000:0000:0000:0001') {
+        return { valid: false, reason: 'Localhost access not allowed' };
+      }
+      // Check for IPv4-mapped IPv6
+      if (normalized.startsWith('0000:0000:0000:0000:0000:ffff:')) {
+        return { valid: false, reason: 'IPv4-mapped IPv6 not allowed' };
+      }
+      // Check for link-local and private IPv6
+      if (normalized.startsWith('fe80:') || normalized.startsWith('fc00:') || normalized.startsWith('fd00:')) {
+        return { valid: false, reason: 'Private IPv6 addresses not allowed' };
+      }
+    } catch (e) {
+      // Invalid IPv6 format, continue with other checks
+    }
+  }
+
+  // Check if it's a direct IP address
+  if (isPrivateIP(cleanedHostname)) {
+    return { valid: false, reason: 'Private IP addresses not allowed' };
+  }
+
+  // Perform DNS resolution to check if domain resolves to private IP
+  try {
+    // Try IPv4 resolution
+    try {
+      const addresses = await dnsResolve(hostname);
+      for (const addr of addresses) {
+        if (isPrivateIP(addr)) {
+          return { valid: false, reason: 'Domain resolves to private IP address' };
+        }
+      }
+    } catch (e) {
+      // IPv4 resolution failed, that's okay
+    }
+
+    // Try IPv6 resolution
+    try {
+      const addresses = await dnsResolve6(hostname);
+      for (const addr of addresses) {
+        if (isPrivateIP(addr)) {
+          return { valid: false, reason: 'Domain resolves to private IP address' };
+        }
+      }
+    } catch (e) {
+      // IPv6 resolution failed, that's okay
+    }
+  } catch (error) {
+    // DNS resolution errors are acceptable (domain might not exist yet)
+  }
+
+  return { valid: true };
+}
 
 // Health check
 app.get('/health', (req, res) => {
@@ -116,18 +252,14 @@ app.post('/screenshot', async (req, res) => {
     });
   }
 
-  // Block localhost/private IPs (SSRF protection)
+  // Comprehensive hostname validation (SSRF protection with DNS rebinding prevention)
   const hostname = parsedUrl.hostname.toLowerCase();
-  const blockedHosts = ['localhost', '127.0.0.1', '0.0.0.0', '::1'];
-  if (
-    blockedHosts.includes(hostname) ||
-    hostname.startsWith('192.168.') ||
-    hostname.startsWith('10.') ||
-    hostname.startsWith('172.')
-  ) {
+  const hostnameValidation = await validateHostname(hostname);
+
+  if (!hostnameValidation.valid) {
     return res.status(400).json({
       error: 'Forbidden URL',
-      message: 'Cannot capture localhost or private network URLs',
+      message: hostnameValidation.reason || 'Cannot capture localhost or private network URLs',
     });
   }
 
@@ -187,6 +319,20 @@ app.post('/screenshot', async (req, res) => {
     const finalUrl = page.url();
     const title = await page.title();
 
+    // Validate final URL after redirects (prevent redirect-based SSRF)
+    try {
+      const finalParsedUrl = new URL(finalUrl);
+      const finalHostname = finalParsedUrl.hostname.toLowerCase();
+      const finalValidation = await validateHostname(finalHostname);
+
+      if (!finalValidation.valid) {
+        throw new Error(`Redirect to forbidden URL detected: ${finalValidation.reason}`);
+      }
+    } catch (error) {
+      console.error(`[Security] Blocked redirect to forbidden URL: ${finalUrl}`);
+      throw new Error('URL redirected to a forbidden destination');
+    }
+
     // Take screenshot
     const screenshot = await page.screenshot({
       fullPage: fullPage,
@@ -202,8 +348,6 @@ app.post('/screenshot', async (req, res) => {
 
     console.log(`[Puppeteer] Success: ${url} -> ${screenshotSize} bytes`);
 
-    await browser.close();
-
     // Return screenshot as base64 for JSON response
     res.json({
       screenshot: screenshot.toString('base64'),
@@ -216,14 +360,19 @@ app.post('/screenshot', async (req, res) => {
   } catch (error) {
     console.error(`[Puppeteer] Error capturing ${url}:`, error.message);
 
-    if (browser) {
-      await browser.close();
-    }
-
     res.status(500).json({
       error: 'Failed to capture screenshot',
       message: error.message,
     });
+  } finally {
+    // Always close browser, even if errors occur
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (closeError) {
+        console.error('[Puppeteer] Error closing browser:', closeError.message);
+      }
+    }
   }
 });
 
