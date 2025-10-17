@@ -205,7 +205,15 @@ const swaggerUiOptions = {
   }
 };
 
-app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(openapiSpec, swaggerUiOptions));
+// Custom middleware to handle redirect without trailing slash
+// This prevents swagger-ui-express from issuing absolute redirects
+// which would bypass the nginx reverse proxy path prefix
+app.use('/api-docs', (req, res, next) => {
+  if (req.originalUrl === '/api-docs') {
+    return res.redirect('/api-docs/');
+  }
+  next();
+}, swaggerUi.serve, swaggerUi.setup(openapiSpec, swaggerUiOptions));
 
 // Health check
 app.get('/health', (req, res) => {
