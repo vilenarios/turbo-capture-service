@@ -91,6 +91,9 @@ COPY --chown=pptruser:pptruser . .
 # Switch to non-root user
 USER pptruser
 
+# Set Puppeteer cache directory
+ENV PUPPETEER_CACHE_DIR=/home/pptruser/.cache/puppeteer
+
 # Expose port
 EXPOSE 3001
 
