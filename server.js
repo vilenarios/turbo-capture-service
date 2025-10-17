@@ -85,7 +85,7 @@ app.get('/health', (req, res) => {
 app.post('/screenshot', async (req, res) => {
   const {
     url,
-    waitFor = 5000,
+    waitFor = 10000,
     viewportWidth = 1280,
     viewportHeight = 800,
     fullPage = true,
