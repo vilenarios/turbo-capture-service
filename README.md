@@ -9,7 +9,8 @@ Screenshot capture service using Puppeteer with stealth mode for bot detection e
 - Configurable viewport sizes
 - Returns base64-encoded PNG screenshots
 - CORS-enabled for frontend integration
-- **Rate limiting** (3 requests/minute per IP)
+- **Rate limiting** (1 request/min with x402, 3 requests/min without)
+- **x402 payment protocol** for AI agents to bypass rate limits
 - **Input validation & SSRF protection**
 - **Security headers** (Helmet.js)
 
@@ -40,11 +41,19 @@ Edit `.env` with your settings:
 PORT=3001
 ALLOWED_ORIGINS=http://localhost:5175,https://yourdomain.com
 NODE_ENV=production
+
+# x402 Payment Configuration (Optional)
+ENABLE_X_402=true
+X_402_WALLET_ADDRESS=0x26B751183814E6BA865c1B65BC00ab4d5501CE8C
+X_402_NETWORK=base
+X_402_FACILITATOR_URL=https://facilitator.x402.rs
+X_402_PRICE=$0.01
 ```
 
 **⚠️ IMPORTANT:**
 - Set specific ALLOWED_ORIGINS (don't use `*` in production)
 - Keep your `.env` file secret (it's in `.gitignore`)
+- Replace `X_402_WALLET_ADDRESS` with your own wallet address to receive payments
 
 ## Usage
 
@@ -118,7 +127,112 @@ curl -X POST http://localhost:3001/screenshot \
   -d '{"url": "https://example.com"}'
 ```
 
-**Rate Limit:** 3 requests per minute per IP address
+**Rate Limit:** 1 request per minute per IP (when x402 enabled), or 3 requests per minute (x402 disabled)
+
+## x402 Payment Protocol for AI Agents
+
+This service supports the [x402 payment protocol](https://github.com/coinbase/x402), enabling AI agents to bypass rate limits by paying per request.
+
+### How it Works
+
+1. **Free Tier:** 1 request per minute per IP address
+2. **Paid Tier:** Pay $0.01 per screenshot to bypass rate limit using cryptocurrency (USDC on Base)
+
+### Enabling x402
+
+Set in your `.env` file:
+```env
+ENABLE_X_402=true
+X_402_WALLET_ADDRESS=your_wallet_address_here
+X_402_NETWORK=base
+X_402_PRICE=$0.01
+```
+
+### x402 Request Flow
+
+#### Step 1: Initial Request (Rate Limited)
+```bash
+curl -X POST http://localhost:3001/screenshot \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://example.com"}'
+```
+
+**Response (402 Payment Required):**
+```json
+{
+  "error": "Payment Required",
+  "message": "Rate limit exceeded. Pay $0.01 via x402 to continue.",
+  "payment": {
+    "price": "$0.01",
+    "network": "base",
+    "walletAddress": "0x26B751183814E6BA865c1B65BC00ab4d5501CE8C"
+  }
+}
+```
+
+#### Step 2: Sign Payment and Retry
+
+AI agents use x402 client libraries to sign the payment and retry:
+
+```bash
+# Retry with X-PAYMENT header containing payment proof
+curl -X POST http://localhost:3001/screenshot \
+  -H "Content-Type: application/json" \
+  -H "X-PAYMENT: <payment_proof_from_x402_client>" \
+  -d '{"url": "https://example.com"}'
+```
+
+**Response (200 Success):**
+Screenshot captured successfully, bypassing rate limit.
+
+### x402 Client Libraries
+
+For AI agents and developers:
+- **JavaScript/TypeScript:** `npm install @coinbase/x402-client`
+- **Python:** `pip install x402-client`
+
+**Example (Node.js):**
+```javascript
+import { createPayment } from '@coinbase/x402-client';
+
+try {
+  // Initial request
+  const response = await fetch('http://localhost:3001/screenshot', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: 'https://example.com' })
+  });
+
+  if (response.status === 402) {
+    // Payment required
+    const paymentRequest = await response.json();
+
+    // Sign payment with wallet
+    const payment = await createPayment(paymentRequest, wallet);
+
+    // Retry with payment proof
+    const paidResponse = await fetch('http://localhost:3001/screenshot', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-PAYMENT': payment.proof
+      },
+      body: JSON.stringify({ url: 'https://example.com' })
+    });
+
+    const screenshot = await paidResponse.json();
+  }
+} catch (error) {
+  console.error('Error:', error);
+}
+```
+
+### Benefits for AI Agents
+
+- **No waiting:** Bypass rate limits instantly with micropayments
+- **Pay-per-use:** Only pay when needed ($0.01 per screenshot)
+- **Automated:** x402 client libraries handle payment signing
+- **Discoverable:** Service appears in [x402 Bazaar](https://bazaar.x402.org) for AI agent discovery
 
 ## Environment Variables
 
@@ -127,10 +241,11 @@ curl -X POST http://localhost:3001/screenshot \
 ## Security Features
 
 ### 1. Rate Limiting
-- **3 requests per minute per IP address**
+- **Free tier:** 1 request per minute per IP (when x402 enabled), or 3 requests per minute (x402 disabled)
+- **Paid tier:** Bypass via x402 payment ($0.01 per screenshot)
 - Prevents abuse and resource exhaustion
 - Primary defense against malicious use
-- Configurable in `server.js` (line 35-44)
+- Configurable in `server.js`
 
 ### 2. Input Validation
 - URL format validation

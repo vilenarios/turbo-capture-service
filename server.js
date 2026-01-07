@@ -15,6 +15,7 @@ import { promisify } from 'util';
 import swaggerUi from 'swagger-ui-express';
 import YAML from 'yaml';
 import fs from 'fs';
+import { paymentMiddleware } from 'x402-express';
 
 const dnsResolve = promisify(dns.resolve4);
 const dnsResolve6 = promisify(dns.resolve6);
@@ -25,6 +26,13 @@ puppeteer.use(StealthPlugin());
 const app = express();
 const PORT = process.env.PORT || 3001;
 const VERSION = '0.0.1';
+
+// x402 configuration
+const X402_ENABLED = process.env.ENABLE_X_402 === 'true';
+const X402_WALLET_ADDRESS = process.env.X_402_WALLET_ADDRESS || '0x26B751183814E6BA865c1B65BC00ab4d5501CE8C';
+const X402_NETWORK = process.env.X_402_NETWORK || 'base';
+const X402_FACILITATOR_URL = process.env.X_402_FACILITATOR_URL || 'https://facilitator.x402.rs';
+const X402_PRICE_PER_SCREENSHOT = process.env.X_402_PRICE || '$0.01';
 
 // Server statistics
 const startTime = Date.now();
@@ -38,27 +46,116 @@ app.use(helmet());
 const corsOptions = {
   origin: process.env.ALLOWED_ORIGINS?.split(',') || '*',
   methods: ['GET', 'POST'],
-  allowedHeaders: ['Content-Type'],
+  allowedHeaders: ['Content-Type', 'X-PAYMENT'],
 };
 app.use(cors(corsOptions));
 
 // Body parser
 app.use(express.json({ limit: '10kb' })); // Limit payload size
 
-// Rate limiting: 3 requests per minute per IP
+// Rate limiting: Lower limit to encourage x402 usage
 const limiter = rateLimit({
   windowMs: 60 * 1000, // 1 minute
-  max: 3, // 3 requests per minute
+  max: X402_ENABLED ? 1 : 3, // 1 request/min when x402 enabled, 3 otherwise
   message: {
     error: 'Too many requests',
-    message: 'Rate limit exceeded. Maximum 3 screenshots per minute. Please try again later.',
+    message: X402_ENABLED
+      ? `Rate limit exceeded. Pay ${X402_PRICE_PER_SCREENSHOT} via x402 to continue, or wait 60 seconds.`
+      : 'Rate limit exceeded. Maximum 3 screenshots per minute. Please try again later.',
   },
   standardHeaders: true,
   legacyHeaders: false,
+  // Skip rate limiting if valid x402 payment provided
+  skip: (req) => {
+    return X402_ENABLED && req.headers['x-payment'];
+  }
 });
 
-// Apply rate limiting to screenshot endpoint only
-app.use('/screenshot', limiter);
+// x402 payment middleware configuration
+const x402Config = X402_ENABLED ? paymentMiddleware(
+  X402_WALLET_ADDRESS,
+  {
+    "POST /screenshot": {
+      price: X402_PRICE_PER_SCREENSHOT,
+      network: X402_NETWORK,
+      config: {
+        description: "Capture full-page screenshot with headless Chrome using stealth mode",
+        inputSchema: {
+          type: "object",
+          required: ["url"],
+          properties: {
+            url: {
+              type: "string",
+              format: "uri",
+              description: "The URL to capture (HTTP/HTTPS only)"
+            },
+            waitFor: {
+              type: "integer",
+              description: "Additional wait time in milliseconds after page load",
+              default: 10000,
+              minimum: 0,
+              maximum: 30000
+            },
+            viewportWidth: {
+              type: "integer",
+              description: "Browser viewport width in pixels",
+              default: 1280,
+              minimum: 320,
+              maximum: 3840
+            },
+            viewportHeight: {
+              type: "integer",
+              description: "Browser viewport height in pixels",
+              default: 800,
+              minimum: 240,
+              maximum: 2160
+            },
+            fullPage: {
+              type: "boolean",
+              description: "Capture full scrollable page (true) or just viewport (false)",
+              default: true
+            }
+          }
+        },
+        outputSchema: {
+          type: "object",
+          properties: {
+            screenshot: {
+              type: "string",
+              format: "byte",
+              description: "Base64-encoded PNG screenshot"
+            },
+            finalUrl: {
+              type: "string",
+              description: "Final URL after any redirects"
+            },
+            title: {
+              type: "string",
+              description: "Page title"
+            },
+            size: {
+              type: "integer",
+              description: "Screenshot file size in bytes"
+            },
+            capturedAt: {
+              type: "string",
+              format: "date-time",
+              description: "Timestamp of capture"
+            },
+            viewport: {
+              type: "object",
+              description: "Viewport dimensions used"
+            }
+          }
+        }
+      }
+    }
+  },
+  { url: X402_FACILITATOR_URL }
+) : (req, res, next) => next();
+
+// Apply middleware to screenshot endpoint
+app.use('/screenshot', limiter, x402Config);
 
 // Security helper functions
 function isPrivateIP(ip) {
@@ -342,6 +439,28 @@ app.post('/screenshot', async (req, res) => {
     // Wait for additional rendering (JS execution, lazy loading, etc.)
     await new Promise(resolve => setTimeout(resolve, waitFor));
 
+    // Scroll through entire page to trigger lazy-loaded content and Intersection Observers
+    console.log(`[Puppeteer] Scrolling page to trigger lazy content: ${url}`);
+    await page.evaluate(async () => {
+      await new Promise((resolve) => {
+        let totalHeight = 0;
+        const distance = 400;
+        const scrollDelay = 100;
+        const timer = setInterval(() => {
+          window.scrollBy(0, distance);
+          totalHeight += distance;
+          if (totalHeight >= document.body.scrollHeight) {
+            clearInterval(timer);
+            window.scrollTo(0, 0); // scroll back to top for screenshot
+            resolve();
+          }
+        }, scrollDelay);
+      });
+    });
+
+    // Brief wait after scrolling for any final renders
+    await new Promise(resolve => setTimeout(resolve, 500));
+
     // Get page metadata
     const finalUrl = page.url();
     const title = await page.title();
@@ -407,7 +526,18 @@ app.listen(PORT, () => {
   console.log(`[Puppeteer] Server running on http://localhost:${PORT}`);
   console.log(`[Puppeteer] API Docs: http://localhost:${PORT}/api-docs`);
   console.log(`[Puppeteer] Health check: http://localhost:${PORT}/health`);
-  console.log(`[Security] Rate limit: 3 requests/minute per IP`);
+  console.log(`[Security] Rate limit: ${X402_ENABLED ? '1 request/minute (free tier)' : '3 requests/minute per IP'}`);
   console.log(`[Security] CORS origins: ${corsOptions.origin}`);
   console.log(`[Security] Input validation: SSRF protection enabled`);
+
+  if (X402_ENABLED) {
+    console.log(`[x402] Payment protocol: ENABLED`);
+    console.log(`[x402] Price per screenshot: ${X402_PRICE_PER_SCREENSHOT}`);
+    console.log(`[x402] Network: ${X402_NETWORK}`);
+    console.log(`[x402] Wallet: ${X402_WALLET_ADDRESS}`);
+    console.log(`[x402] Facilitator: ${X402_FACILITATOR_URL}`);
+    console.log(`[x402] AI agents can pay to bypass rate limit`);
+  } else {
+    console.log(`[x402] Payment protocol: DISABLED`);
+  }
 });

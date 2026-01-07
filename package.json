@@ -27,6 +27,7 @@
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
     "swagger-ui-express": "^5.0.1",
+    "x402-express": "^0.7.1",
     "yaml": "^2.8.1"
   }
 }
