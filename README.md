@@ -52,8 +52,10 @@ Response: `screenshot` (base64 PNG), `finalUrl`, `title`, `size`, `capturedAt`,
 |---|---|
 | 400 | Invalid input, or the URL / a redirect targets a forbidden destination |
 | 402 | Payment required (x402 enabled, free tier used up, or payment invalid) |
+| 409 | The same payment payload is already being used by another request |
 | 413 / 415 | Body too large / not `application/json` |
-| 429 | Free-tier rate limit (x402 disabled); `Retry-After` |
+| 422 | Screenshot larger than `MAX_PNG_BYTES` |
+| 429 | Free-tier rate limit (x402 disabled), or paid rate limit; `Retry-After` |
 | 502 | Page could not be loaded (DNS, connect, TLS) |
 | 503 | All capture slots and the queue are full; `Retry-After` |
 | 504 | Capture exceeded `CAPTURE_TIMEOUT_MS` |
@@ -74,21 +76,27 @@ stops the service). See `.env.example` for the annotated list.
 | `ALLOWED_ORIGINS` | any | CORS origins, comma-separated |
 | `TRUST_PROXY` | false | Reverse-proxy hops to trust for the client IP (see below) |
 | `RATE_LIMIT_PER_MINUTE` | 3 (1 with x402) | Free-tier requests per client IP per minute |
+| `PAID_RATE_LIMIT_PER_MINUTE` | 30 | Requests with a payment header, per client IP per minute |
 | `MAX_CONCURRENT_CAPTURES` | 2 | Captures running at once (each is a full Chrome) |
 | `MAX_QUEUE` | 4 | Requests waiting for a slot; beyond that, 503 |
 | `QUEUE_TIMEOUT_MS` | 30000 | Max wait in the queue before 503 |
 | `CAPTURE_TIMEOUT_MS` | 60000 | Hard deadline per capture (launch → screenshot) |
 | `NAVIGATION_TIMEOUT_MS` | 30000 | Navigation bound (also capped by the deadline) |
-| `MAX_SCREENSHOT_HEIGHT` | 16384 | Full-page screenshots are clipped to this height |
+| `MAX_SCREENSHOT_HEIGHT` | 16384 | Screenshots are clipped to this height |
+| `MAX_SCREENSHOT_PIXELS` | 25000000 | Pixel budget (width × height); taller shots are clipped to fit |
+| `MAX_PNG_BYTES` | 25 MiB | Encoded PNG larger than this → `422` |
 | `SCROLL_MAX_STEPS` / `SCROLL_MAX_MS` | 40 / 10000 | Lazy-load scroll budget |
-| `MAX_EGRESS_BYTES` | 200 MiB | Download budget per capture |
+| `MAX_EGRESS_BYTES` | 200 MiB | Bytes received from upstream servers per capture before its connections are cut |
+| `DNS_TIMEOUT_MS` / `DNS_TRIES` | 5000 / 2 | Per-lookup bound for the proxy's resolver |
+| `DNS_MAX_CONCURRENT` / `DNS_MAX_QUEUE` | 6 / 64 | Lookups in flight / waiting, per capture |
+| `PRECHECK_DNS_TIMEOUT_MS` | 3000 | Lookup bound for the top-level pre-check |
 | `ALLOWED_PORTS` | 80,443,8080,8443 | Destination ports Chrome may use (`*` = any) |
 | `BLOCKED_CIDRS` | none | Extra ranges to refuse (your own public IPs, LBs, NAT) |
 | `CHROME_SANDBOX` | true | Keep Chrome's sandbox; see "Chrome sandbox" |
 | `ENABLE_X_402` | false | x402 payments |
 | `X_402_WALLET_ADDRESS` | none | Required when x402 is on; start-up fails without it |
 | `X_402_NETWORK` | base | `base`, `base-sepolia` or `eip155:<chainId>` |
-| `X_402_FACILITATOR_URL` | https://facilitator.x402.rs | Must be https |
+| `X_402_FACILITATOR_URL` | none | Required when x402 is on; https; must be an x402 v2 facilitator for your network |
 | `X_402_PRICE` | $0.01 | Price per capture |
 
 ### Running behind a reverse proxy: `TRUST_PROXY`
@@ -114,14 +122,28 @@ request the proxy:
    through CDP; the proxy listens on 127.0.0.1 only and is closed after the capture;
 2. refuses `localhost`, `*.localhost`, `*.local`, `*.internal`, and ports outside
    `ALLOWED_PORTS`;
-3. resolves the host once (all A and AAAA records) and refuses the request if any
+3. resolves the host once (all A and AAAA records, see "DNS" below) and refuses the request if any
    address is not public unicast (`src/address.js`: ipaddr.js `range()` plus explicit
    lists: 0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.0.0/24, TEST-NETs,
    192.88.99/24, 192.168/16, 198.18/15, 224/4, 240/4, Azure 168.63.129.16; for IPv6
-   only 2000::/3 minus documentation, Teredo/6to4 and other special ranges, with
-   IPv4-mapped, IPv4-compatible and NAT64 `64:ff9b::/96` addresses judged by their
-   embedded IPv4);
+   only 2000::/3 minus documentation, Teredo/6to4 and other special ranges;
+   IPv4-mapped (`::ffff:0:0/96`) and NAT64 (`64:ff9b::/96`) addresses are judged by
+   their embedded IPv4, and deprecated IPv4-compatible addresses (`::/96`) are always
+   refused);
 4. connects to the validated IP, never re-resolving (no DNS-rebinding window).
+
+**DNS.** Lookups use a c-ares resolver (DNS on the event loop), not `getaddrinfo`
+on the libuv threadpool, so a nameserver that never answers cannot stall other
+captures or the file system. Each capture's proxy has its own resolver with a
+per-lookup timeout (`DNS_TIMEOUT_MS`, default 5 s, `DNS_TRIES` attempts), at most
+`DNS_MAX_CONCURRENT` lookups in flight and `DNS_MAX_QUEUE` waiting (more fail
+immediately); closing the proxy cancels its pending lookups. The top-level
+pre-check uses its own short-lived resolver (`PRECHECK_DNS_TIMEOUT_MS`, default
+3 s). CNAME chains are followed and every final A/AAAA address must be public;
+NXDOMAIN or no records fail the request, and so does a timeout or SERVFAIL for
+either family (the service will not decide on a partial answer). The proxy uses
+DNS only: `/etc/hosts` is not consulted (names like `localhost` are refused by
+name before any lookup), and the nameservers are the container's `resolv.conf`.
 
 Other Chrome flags back this up: QUIC off, WebRTC limited to proxied TCP,
 `--host-resolver-rules=MAP * ~NOTFOUND` (Chrome cannot resolve names itself), DNS
@@ -175,25 +197,35 @@ fresh Chrome profile per capture, and the network-level egress restrictions abov
 - One deadline (`CAPTURE_TIMEOUT_MS`) covers launch, navigation, `waitFor`, the
   scroll pass and the screenshot. On expiry Chrome's process group is killed.
 - The scroll pass is bounded by steps and time, so infinite-scroll pages finish.
-- Full-page screenshots are clipped to `MAX_SCREENSHOT_HEIGHT`.
+- Screenshots are clipped to `MAX_SCREENSHOT_HEIGHT` and to the pixel budget
+  `MAX_SCREENSHOT_PIXELS` (width × height); an encoded PNG over `MAX_PNG_BYTES` is
+  refused with `422`. The PNG comes from Chrome as base64 and is written into the
+  response without a decode/re-encode or a `JSON.stringify` copy.
 - If the client disconnects, the capture is aborted and Chrome killed.
 - Chrome runs under `tini`; a reaper kills any Chrome process that outlives its
   browser.
 
 ## x402 payments
 
-With `ENABLE_X_402=true` (and a valid `X_402_WALLET_ADDRESS`, or the service refuses
-to start), clients within the free tier are served as usual. Over the free tier
+With `ENABLE_X_402=true` (and a valid `X_402_WALLET_ADDRESS` and
+`X_402_FACILITATOR_URL`, or the service refuses to start), clients within the free tier are served as usual. Over the free tier
 they receive `402 Payment Required` with the x402 v2 `PAYMENT-REQUIRED` header, and
 may retry with a `PAYMENT-SIGNATURE` header produced by an x402 v2 client (e.g.
 `@x402/fetch`). A request carrying a payment header skips the free-tier limiter but
 goes straight to payment verification: garbage or invalid payments get `402` and no
 capture runs. Payment is settled only after a successful capture; a capture that
-fails, times out or is refused for capacity (`503`) is not charged.
+fails, times out, is abandoned by the client or is refused for capacity (`503`)
+is not charged.
+
+Paid requests are limited too: `PAID_RATE_LIMIT_PER_MINUTE` per client IP, and a
+payment payload that is already being served cannot be used by a second
+concurrent request (`409`).
 
 The service uses the x402 v2 packages (`@x402/express`, `@x402/core`, `@x402/evm`).
-x402 v1 `X-PAYMENT` headers are no longer accepted. Make sure the facilitator you
-configure supports x402 v2 and your network.
+x402 v1 `X-PAYMENT` headers are no longer accepted. There is no default
+facilitator: set `X_402_FACILITATOR_URL` to an x402 **v2** facilitator and verify
+that it supports v2 payments on the network you configure (its `/supported`
+endpoint lists `x402Version: 2` kinds per network) before enabling payments.
 
 ## Deployment
 
@@ -211,9 +243,12 @@ configure supports x402 v2 and your network.
 All tooling runs in containers:
 
 ```bash
-# unit + integration tests (real Chrome, local fixtures only, no network)
+# unit + integration tests (real Chrome, local fixtures only, no network).
+# --dns/--sysctl let the DNS-starvation test run a fake nameserver on
+# 127.0.0.1:53 inside the container (it skips without them).
 docker build --target test -t turbo-capture:test .
-docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges \
+docker run --rm --network none --dns 127.0.0.1 --sysctl net.ipv4.ip_unprivileged_port_start=0 \
+  --cap-drop ALL --security-opt no-new-privileges \
   --security-opt seccomp=$PWD/seccomp/chrome.json --read-only --tmpfs /tmp \
   turbo-capture:test
 

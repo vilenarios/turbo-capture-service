@@ -15,9 +15,12 @@ load-bearing parts of the design.
 Run Node/npm/Chrome only inside containers (Node >= 22.12; host Node may be old):
 
 ```bash
-# full test suite in the built image (real Chrome, local fixtures, no network)
+# full test suite in the built image (real Chrome, local fixtures, no network).
+# --dns/--sysctl let test/dns-starvation.test.js run a fake nameserver on
+# 127.0.0.1:53 inside the container (it skips without them).
 docker build --target test -t turbo-capture:test .
-docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges \
+docker run --rm --network none --dns 127.0.0.1 --sysctl net.ipv4.ip_unprivileged_port_start=0 \
+  --cap-drop ALL --security-opt no-new-privileges \
   --security-opt seccomp=$PWD/seccomp/chrome.json --read-only --tmpfs /tmp turbo-capture:test
 # one file / one test; TEST_DEBUG=1 prints service logs
 docker run ... turbo-capture:test node --test --test-name-pattern='redirect' test/integration.test.js
@@ -35,7 +38,7 @@ docker compose up -d --build   # reads .env (cp .env.example .env)
 - `server.js` – production entry: `loadConfig()`, Chrome self-test, `createApp()`,
   listen, orphan-Chrome reaper, signal handling.
 - `src/config.js` – every env var, parsed and range-checked; invalid → exit 1.
-  x402 enabled without a valid wallet is fatal (no default wallet).
+  x402 enabled without a valid wallet or facilitator URL is fatal (no defaults).
 - `src/app.js` – Express app: request ids, helmet, CORS, rate limit / x402 gate,
   validation, pre-check, concurrency gate, error mapping, swagger, health.
 - `src/validate.js` – strict body schema and the fast top-level URL pre-check.
@@ -44,6 +47,10 @@ docker compose up -d --build   # reads .env (cp .env.example .env)
   deadline (`step()` races every await against an abort), bounded scroll, clipped
   screenshot, teardown (kill process group), `reapOrphanChrome()`.
 - `src/egress-proxy.js` – HTTP + CONNECT forward proxy; the enforcement point.
+- `src/resolver.js` – bounded c-ares resolver (A+AAAA, hard timeout, concurrency
+  cap + bounded queue, `cancel()`); one per proxy and one per pre-check. Never
+  go back to `dns.lookup`/getaddrinfo: it runs on the 4-thread libuv pool and a
+  silent nameserver stalls the whole service. DNS only (no /etc/hosts).
 - `src/address.js` – public-address classification (`isPublicAddress`) and
   forbidden host names.
 - `seccomp/chrome.json` – Docker default profile + clone/unshare/setns/chroot so
@@ -76,7 +83,14 @@ docker compose up -d --build   # reads .env (cp .env.example .env)
   middleware (verify, settle only on success). Otherwise the free-tier limiter;
   when exhausted, its handler answers with the x402 402 (or 429 if x402 is off).
   Garbage headers therefore get 402 and never reach the capture.
-- Paid requests still go through `CaptureGate` (503 when full; not settled).
+- Paid requests still go through `CaptureGate` (503 when full; not settled), a
+  per-IP paid limiter (`PAID_RATE_LIMIT_PER_MINUTE`), and an in-flight set that
+  refuses a payment payload already being served (409).
+- `app.locals.paymentInFlight` counts x402 middleware runs until they finish;
+  every exit path must end the response (aborted clients get `499` via
+  `endGone()`), or @x402/express waits forever.
+- Screenshot size: `MAX_SCREENSHOT_HEIGHT`, pixel budget `MAX_SCREENSHOT_PIXELS`,
+  `MAX_PNG_BYTES` (422). The PNG stays base64 from CDP to the response body.
 
 ## Adding a screenshot option
 

@@ -22,8 +22,10 @@ info:
       both are full the service answers `503` with `Retry-After`.
     - Each capture has a hard deadline (default 60 s) covering launch, navigation,
       waits, lazy-load scrolling and the screenshot (`504` when exceeded).
-    - Full-page screenshots are clipped to a maximum height (default 16384 px);
-      `clipped` says whether that happened.
+    - Screenshots are clipped to a maximum height (default 16384 px) and a pixel
+      budget (default 25 million pixels); `clipped` says whether that happened. An
+      encoded PNG over the byte cap (default 25 MiB) is refused with `422`.
+    - DNS lookups are bounded (timeout, per-capture concurrency cap).
     - Free-tier rate limit per client IP (default 3/min, 1/min with x402 enabled).
   version: 0.1.0
   contact:
@@ -79,7 +81,9 @@ paths:
           free-tier limiter but must pass payment verification; a missing, malformed
           or invalid payment gets `402` and no capture runs. Payment is settled only
           when the capture succeeds.
-        - Paid requests are still subject to the concurrency limit (`503`).
+        - Paid requests are still subject to the concurrency limit (`503`), have
+          their own per-IP rate limit (`429`), and a payment payload already being
+          served cannot be reused concurrently (`409`).
 
         **Process**
         1. Validate the body strictly and pre-check the URL (fast `400`).
@@ -163,6 +167,12 @@ paths:
               schema:
                 type: string
               description: Base64-encoded x402 v2 payment requirements.
+        '409':
+          description: The same x402 payment payload is already being used by another request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         '413':
           description: Request body larger than 10 kB
           content:
@@ -175,8 +185,15 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: The screenshot exceeds the PNG byte cap
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example: { error: "Screenshot too large", message: "The screenshot exceeds the 26214400-byte limit; use a smaller viewport or fullPage=false", requestId: "6f1c2c8e-1d1b-4c43-9a51-2f0f0e9f4a11" }
         '429':
-          description: Free-tier rate limit exceeded (x402 disabled)
+          description: Free-tier rate limit exceeded (x402 disabled), or paid-request rate limit exceeded
           headers:
             Retry-After:
               schema:
@@ -297,7 +314,7 @@ components:
           description: Height of the PNG in pixels
         clipped:
           type: boolean
-          description: True when the page was taller than the maximum screenshot height
+          description: True when the screenshot was cut to the maximum height or the pixel budget
         requestId:
           type: string
           format: uuid
