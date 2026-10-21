@@ -1,8 +1,13 @@
-node_modules
-npm-debug.log
-.env
-.git
-.gitignore
-README.md
-.DS_Store
-*.log
+# Allow-list: the build context contains only what the image needs.
+# Everything else (.git, .claude, CLAUDE.md, docs, local .env files and
+# secrets, node_modules, logs) is excluded.
+*
+!package.json
+!package-lock.json
+!server.js
+!openapi.yaml
+!src/
+!src/**
+# test/ is only used by the `test` build stage, never copied into production
+!test/
+!test/**

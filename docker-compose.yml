@@ -1,33 +1,46 @@
-version: '3.8'
-
 services:
   screenshot-service:
     build:
       context: .
       dockerfile: Dockerfile
+      target: production
+    image: turbo-capture-service:local
     container_name: turbo-capture-service
+    # Bound to loopback: put nginx / a load balancer in front and set
+    # TRUST_PROXY accordingly. Use BIND_ADDRESS=0.0.0.0 to expose directly.
     ports:
-      - "3001:3001"
+      - "${BIND_ADDRESS:-127.0.0.1}:${HOST_PORT:-3001}:3001"
+    # All settings come from .env (cp .env.example .env).
+    env_file:
+      - .env
     environment:
       - NODE_ENV=production
       - PORT=3001
     restart: unless-stopped
-    # Resource limits (optional - adjust based on your needs)
+    # --- hardening -------------------------------------------------------
+    # The Chrome sandbox stays ON: seccomp/chrome.json is Docker's default
+    # profile plus clone/unshare/setns/chroot, which Chrome's namespace
+    # sandbox needs. No capabilities are required.
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./seccomp/chrome.json
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      # Chrome profiles, HOME and temp files live here (per capture, deleted after).
+      - /tmp:size=1g,mode=1777
+    pids_limit: 1024
     deploy:
       resources:
         limits:
-          cpus: '2.0'
+          cpus: "2.0"
           memory: 2G
         reservations:
-          cpus: '0.5'
+          cpus: "0.5"
           memory: 512M
-    # Security options
-    security_opt:
-      - no-new-privileges:true
-    # Healthcheck
-    healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3001/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
