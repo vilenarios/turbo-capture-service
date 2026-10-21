@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { createApp } from '../src/app.js';
+import { CaptureError } from '../src/capture.js';
 import { loadConfig } from '../src/config.js';
 import { fakeNet, listen, close } from './helpers/net.js';
 import { testConfig, startApp, silentLog } from './helpers/app.js';
@@ -18,7 +19,7 @@ function stubCapture({ gate } = {}) {
   const fn = async (params) => {
     calls.push(params);
     if (gate) await gate;
-    return { screenshot: PNG_1x1, finalUrl: params.url, title: 't', size: PNG_1x1.length, height: 1, clipped: false, egress: {}, durationMs: 1 };
+    return { screenshotBase64: PNG_1x1.toString('base64'), finalUrl: params.url, title: 't', size: PNG_1x1.length, height: 1, clipped: false, egress: {}, durationMs: 1 };
   };
   fn.calls = calls;
   return fn;
@@ -258,5 +259,187 @@ test('x402: a verified payment is still subject to the concurrency cap and is no
   } finally {
     await s.close();
     await fac.close();
+  }
+});
+
+// --- review follow-ups --------------------------------------------------------
+
+function x402Config(fac, env = {}, overrides = {}) {
+  return {
+    ...loadConfig({
+      ENABLE_X_402: 'true',
+      X_402_WALLET_ADDRESS: '0x' + '12'.repeat(20),
+      X_402_NETWORK: 'base-sepolia',
+      X_402_FACILITATOR_URL: fac.url,
+      RATE_LIMIT_PER_MINUTE: '1',
+      ...env,
+    }),
+    ...overrides,
+  };
+}
+
+/** Use up the free tier and build a payment header the fake facilitator approves. */
+async function paymentHeader(base) {
+  await post(base, { url: 'https://site.public.test/' }); // free request (or already over)
+  const unpaid = await post(base, { url: 'https://site.public.test/' });
+  assert.equal(unpaid.status, 402);
+  const required = JSON.parse(Buffer.from(unpaid.headers.get('payment-required'), 'base64').toString());
+  return (nonce) =>
+    Buffer.from(
+      JSON.stringify({ x402Version: 2, resource: required.resource, accepted: required.accepts[0], payload: { signature: '0x' + '11'.repeat(65), authorization: { nonce } } }),
+    ).toString('base64');
+}
+
+/** Capture stub that runs until the client goes away. */
+function abortableCapture() {
+  const calls = [];
+  const fn = (params, ctx) => {
+    calls.push(params);
+    return new Promise((_, reject) => {
+      const fail = () => reject(new CaptureError('ABORTED', 'Client disconnected'));
+      if (ctx.signal.aborted) return fail();
+      ctx.signal.addEventListener('abort', fail, { once: true });
+    });
+  };
+  fn.calls = calls;
+  return fn;
+}
+
+function rawPost(base, body, headers = {}) {
+  const u = new URL(base);
+  const req = http.request({ host: u.hostname, port: u.port, method: 'POST', path: '/screenshot', headers: { 'content-type': 'application/json', ...headers } });
+  req.on('error', () => {});
+  req.end(JSON.stringify(body));
+  return req;
+}
+
+const until = async (cond, ms = 3_000) => {
+  const t = Date.now() + ms;
+  while (!cond() && Date.now() < t) await new Promise((r) => setTimeout(r, 20));
+  return cond();
+};
+
+test('x402: a paid request whose client disconnects ends its response (no leaked middleware) and is not settled', async () => {
+  const fac = await startFakeFacilitator({ approve: true });
+  const cap = abortableCapture();
+  const free = stubCapture();
+  let block = false;
+  const app = await createApp(x402Config(fac), { log: silentLog, capture: (p, ctx) => (block ? cap(p, ctx) : free(p, ctx)), net: fakeNet({}) });
+  const s = await startApp(app);
+  try {
+    const pay = await paymentHeader(s.url);
+    block = true;
+    const req = rawPost(s.url, { url: 'https://site.public.test/' }, { 'payment-signature': pay('a') });
+    assert.ok(await until(() => cap.calls.length === 1), 'capture started');
+    assert.equal(app.locals.paymentInFlight, 1);
+    req.destroy();
+    assert.ok(await until(() => app.locals.paymentInFlight === 0), `payment middleware still waiting: ${app.locals.paymentInFlight}`);
+    assert.ok(!fac.calls.some((c) => c.url.endsWith('/settle')));
+    assert.equal(app.locals.gate.active, 0);
+  } finally {
+    await s.close();
+    await fac.close();
+  }
+});
+
+test('x402: a successful paid capture is settled and returns PAYMENT-RESPONSE', async () => {
+  const fac = await startFakeFacilitator({ approve: true });
+  const cap = stubCapture();
+  const app = await createApp(x402Config(fac), { log: silentLog, capture: cap, net: fakeNet({}) });
+  const s = await startApp(app);
+  try {
+    const pay = await paymentHeader(s.url);
+    const r = await post(s.url, { url: 'https://site.public.test/' }, { 'payment-signature': pay('b') });
+    assert.equal(r.status, 200);
+    const j = await r.json();
+    assert.ok(j.screenshot.length > 0);
+    assert.ok(r.headers.get('payment-response'), 'PAYMENT-RESPONSE header');
+    assert.equal(fac.calls.filter((c) => c.url.endsWith('/settle')).length, 1);
+    assert.equal(app.locals.paymentInFlight, 0);
+  } finally {
+    await s.close();
+    await fac.close();
+  }
+});
+
+test('x402: paid requests have their own per-IP rate limit', async () => {
+  const fac = await startFakeFacilitator({ approve: true });
+  const app = await createApp(x402Config(fac, { PAID_RATE_LIMIT_PER_MINUTE: '2' }, { rateLimitPerMinute: 1 }), { log: silentLog, capture: stubCapture(), net: fakeNet({}) });
+  const s = await startApp(app);
+  try {
+    const pay = await paymentHeader(s.url);
+    const st = [];
+    for (const n of ['1', '2', '3']) st.push((await post(s.url, { url: 'https://site.public.test/' }, { 'payment-signature': pay(n) })).status);
+    assert.deepEqual(st, [200, 200, 429]);
+  } finally {
+    await s.close();
+    await fac.close();
+  }
+});
+
+test('x402: the same payment payload cannot be used concurrently', async () => {
+  const fac = await startFakeFacilitator({ approve: true });
+  let open;
+  const gate = new Promise((r) => (open = r));
+  const free = stubCapture();
+  const cap = stubCapture({ gate });
+  let block = false;
+  const app = await createApp(x402Config(fac, {}, { maxConcurrentCaptures: 2 }), {
+    log: silentLog,
+    capture: (p, ctx) => (block ? cap(p, ctx) : free(p, ctx)),
+    net: fakeNet({}),
+  });
+  const s = await startApp(app);
+  try {
+    const pay = await paymentHeader(s.url);
+    block = true;
+    const header = pay('same');
+    const first = post(s.url, { url: 'https://site.public.test/' }, { 'payment-signature': header });
+    assert.ok(await until(() => app.locals.gate.active === 1));
+    const replay = await post(s.url, { url: 'https://site.public.test/' }, { 'payment-signature': header });
+    assert.equal(replay.status, 409);
+    open();
+    assert.equal((await first).status, 200);
+  } finally {
+    open();
+    await s.close();
+    await fac.close();
+  }
+});
+
+test('a client that disconnects during the pre-check never starts a capture', async () => {
+  const cap = stubCapture();
+  const base = fakeNet({});
+  const slowNet = { ...base, lookup: async (h) => (await new Promise((r) => setTimeout(r, 600)), base.lookup(h)) };
+  const app = await createApp(testConfig({ rateLimitPerMinute: 1000 }), { log: silentLog, capture: cap, net: slowNet });
+  const s = await startApp(app);
+  try {
+    const req = rawPost(s.url, { url: 'https://site.public.test/' });
+    await new Promise((r) => setTimeout(r, 150));
+    req.destroy();
+    await new Promise((r) => setTimeout(r, 1_000));
+    assert.equal(cap.calls.length, 0, 'capture ran for a client that had already gone');
+    assert.equal(app.locals.gate.active, 0);
+  } finally {
+    await s.close();
+  }
+});
+
+test('an oversized PNG is refused with a clear error', async () => {
+  const app = await createApp(testConfig({ rateLimitPerMinute: 1000, maxPngBytes: 1024 }), {
+    log: silentLog,
+    capture: async () => {
+      throw new CaptureError('TOO_LARGE', 'PNG exceeds MAX_PNG_BYTES');
+    },
+    net: fakeNet({}),
+  });
+  const s = await startApp(app);
+  try {
+    const r = await post(s.url, { url: 'https://site.public.test/' });
+    assert.equal(r.status, 422);
+    const j = await r.json();
+    assert.equal(j.error, 'Screenshot too large');
+  } finally {
+    await s.close();
   }
 });

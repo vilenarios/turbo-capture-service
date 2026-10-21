@@ -26,15 +26,17 @@ test('x402 enabled without a wallet refuses to start (no hardcoded default)', ()
 });
 
 test('x402 enabled with a valid wallet', () => {
-  const c = loadConfig({ ENABLE_X_402: 'true', X_402_WALLET_ADDRESS: WALLET, X_402_NETWORK: 'base-sepolia' });
+  const FAC = { X_402_FACILITATOR_URL: 'https://facilitator.example' };
+  assert.throws(() => loadConfig({ ENABLE_X_402: 'true', X_402_WALLET_ADDRESS: WALLET }), /X_402_FACILITATOR_URL/, 'no default facilitator');
+  const c = loadConfig({ ENABLE_X_402: 'true', X_402_WALLET_ADDRESS: WALLET, X_402_NETWORK: 'base-sepolia', ...FAC });
   assert.equal(c.x402.enabled, true);
   assert.equal(c.x402.wallet, WALLET);
   assert.equal(c.x402.network, 'eip155:84532');
   assert.equal(c.rateLimitPerMinute, 1);
-  assert.equal(loadConfig({ ENABLE_X_402: 'true', X_402_WALLET_ADDRESS: WALLET }).x402.network, 'eip155:8453');
-  assert.throws(() => loadConfig({ ENABLE_X_402: 'true', X_402_WALLET_ADDRESS: WALLET, X_402_NETWORK: 'solana' }), ConfigError);
+  assert.equal(loadConfig({ ENABLE_X_402: 'true', X_402_WALLET_ADDRESS: WALLET, ...FAC }).x402.network, 'eip155:8453');
+  assert.throws(() => loadConfig({ ENABLE_X_402: 'true', X_402_WALLET_ADDRESS: WALLET, X_402_NETWORK: 'solana', ...FAC }), ConfigError);
   assert.throws(() => loadConfig({ ENABLE_X_402: 'true', X_402_WALLET_ADDRESS: WALLET, X_402_FACILITATOR_URL: 'http://facilitator.example' }), ConfigError);
-  assert.throws(() => loadConfig({ ENABLE_X_402: 'true', X_402_WALLET_ADDRESS: WALLET, X_402_PRICE: 'free' }), ConfigError);
+  assert.throws(() => loadConfig({ ENABLE_X_402: 'true', X_402_WALLET_ADDRESS: WALLET, X_402_PRICE: 'free', ...FAC }), ConfigError);
 });
 
 test('TRUST_PROXY parsing', () => {

@@ -23,7 +23,7 @@ export const CHROME_PATH = await Promise.resolve()
 
 export class CaptureError extends Error {
   /**
-   * @param {'TIMEOUT'|'FORBIDDEN_DESTINATION'|'NAVIGATION_FAILED'|'ABORTED'|'INTERNAL'} code
+   * @param {'TIMEOUT'|'FORBIDDEN_DESTINATION'|'NAVIGATION_FAILED'|'ABORTED'|'TOO_LARGE'|'INTERNAL'} code
    */
   constructor(code, message, cause) {
     super(message, { cause });
@@ -236,6 +236,7 @@ export async function capture(params, ctx) {
     allowedPorts: config.allowedPorts,
     extraDeny: config.extraDeny,
     maxBytes: config.maxEgressBytes,
+    dns: config.dns,
     onEvent: (e) => log.info('egress', e),
   });
   const userDataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'capture-'));
@@ -325,7 +326,6 @@ export async function capture(params, ctx) {
       throw new CaptureError('FORBIDDEN_DESTINATION', 'The page redirected to a forbidden destination');
     }
 
-    let height = params.viewportHeight;
     let contentHeight = params.viewportHeight;
     if (params.fullPage) {
       contentHeight = await step(
@@ -335,26 +335,34 @@ export async function capture(params, ctx) {
         }),
       );
       if (!Number.isFinite(contentHeight) || contentHeight < 1) contentHeight = params.viewportHeight;
-      height = Math.min(Math.max(Math.ceil(contentHeight), params.viewportHeight), config.maxScreenshotHeight);
     }
-    const clipped = params.fullPage && contentHeight > config.maxScreenshotHeight;
+    // Height limit: the explicit cap and the pixel budget (width x height).
+    const maxHeight = Math.max(1, Math.min(config.maxScreenshotHeight, Math.floor(config.maxScreenshotPixels / params.viewportWidth)));
+    const wanted = params.fullPage ? Math.max(Math.ceil(contentHeight), params.viewportHeight) : params.viewportHeight;
+    const height = Math.min(wanted, maxHeight);
+    const clipped = wanted > height;
 
-    const png = await step(
+    // Base64 straight from CDP: no decode/re-encode copy of a large image.
+    const b64 = await step(
       page.screenshot({
         type: 'png',
+        encoding: 'base64',
         clip: { x: 0, y: 0, width: params.viewportWidth, height },
         captureBeyondViewport: params.fullPage,
       }),
     );
+    const size = Math.floor((b64.length * 3) / 4) - (b64.endsWith('==') ? 2 : b64.endsWith('=') ? 1 : 0);
+    if (size > config.maxPngBytes) {
+      throw new CaptureError('TOO_LARGE', `PNG is ${size} bytes, over MAX_PNG_BYTES (${config.maxPngBytes})`);
+    }
     const finalUrl = page.url();
     const title = await step(page.title());
-    const buf = Buffer.from(png);
 
     return {
-      screenshot: buf,
+      screenshotBase64: b64,
       finalUrl,
       title,
-      size: buf.length,
+      size,
       width: params.viewportWidth,
       height,
       clipped,

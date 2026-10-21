@@ -86,7 +86,13 @@ async function buildPaymentMiddleware(x402cfg) {
         description: 'Capture a full-page PNG screenshot of a public web page with headless Chrome',
         mimeType: 'application/json',
         extensions: {
-          ...declareDiscoveryExtension({ method: 'POST', bodyType: 'json', inputSchema, output: { schema: outputSchema } }),
+          ...declareDiscoveryExtension({
+            method: 'POST',
+            bodyType: 'json',
+            input: { url: 'https://example.com', fullPage: true },
+            inputSchema,
+            output: { schema: outputSchema },
+          }),
         },
       },
     },
@@ -106,6 +112,7 @@ export async function createApp(config, deps = {}) {
   const captureImpl = deps.capture ?? realCapture;
   const app = express();
   app.disable('x-powered-by');
+  app.set('etag', false); // do not hash multi-megabyte screenshot bodies
   app.set('trust proxy', config.trustProxy);
 
   const gate = new CaptureGate({
@@ -144,12 +151,38 @@ export async function createApp(config, deps = {}) {
     handler: (req, res, next) => {
       if (payment) {
         // Free tier exhausted: answer with the x402 402 Payment Required.
-        return payment(req, res, next);
+        return runPayment(req, res, next);
       }
       res.setHeader('Retry-After', '60');
       res.status(429).json(errBody(req, 'Too many requests', `Rate limit exceeded. Maximum ${config.rateLimitPerMinute} screenshots per minute.`));
     },
   });
+
+  // Requests carrying a payment header have their own (higher) per-IP limit,
+  // so one valid authorization cannot be replayed at will.
+  const paidLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: config.paidRateLimitPerMinute,
+    standardHeaders: 'draft-8',
+    legacyHeaders: false,
+    handler: (req, res) => {
+      res.setHeader('Retry-After', '60');
+      res.status(429).json(errBody(req, 'Too many requests', `Paid rate limit exceeded. Maximum ${config.paidRateLimitPerMinute} paid screenshots per minute.`));
+    },
+  });
+
+  /** Payment payloads currently being served (sha256 of the header). */
+  const paymentsInFlight = new Set();
+  app.locals.paymentInFlight = 0;
+
+  /** Run the x402 middleware, counting it until it has fully finished (incl. settlement). */
+  const runPayment = (req, res, next) => {
+    app.locals.paymentInFlight++;
+    Promise.resolve()
+      .then(() => payment(req, res, next))
+      .catch((err) => log.error('payment middleware failed', { requestId: req.id, err: err?.message }))
+      .finally(() => app.locals.paymentInFlight--);
+  };
 
   /**
    * A request carrying a payment header skips the free-tier limiter but must
@@ -157,8 +190,18 @@ export async function createApp(config, deps = {}) {
    * a 402 from the payment middleware and never reaches the capture.
    */
   const paymentOrRateLimit = (req, res, next) => {
-    if (payment && hasPaymentHeader(req)) return payment(req, res, next);
-    return limiter(req, res, next);
+    if (!(payment && hasPaymentHeader(req))) return limiter(req, res, next);
+    paidLimiter(req, res, (err) => {
+      if (err) return next(err);
+      const header = req.get('payment-signature') ?? req.get('x-payment') ?? '';
+      const key = crypto.createHash('sha256').update(header).digest('hex');
+      if (paymentsInFlight.has(key)) {
+        return res.status(409).json(errBody(req, 'Payment in use', 'This payment is already being used by another request'));
+      }
+      paymentsInFlight.add(key);
+      res.on('close', () => paymentsInFlight.delete(key));
+      runPayment(req, res, next);
+    });
   };
 
   // --- routes ----------------------------------------------------------------
@@ -191,6 +234,18 @@ export async function createApp(config, deps = {}) {
 
   app.post('/screenshot', express.json({ limit: '10kb', strict: true }), paymentOrRateLimit, async (req, res) => {
     const rlog = log.child({ requestId: req.id, ip: req.ip });
+    // Abort everything when the client goes away (attached first, so a
+    // disconnect during validation or the pre-check is seen too).
+    const clientGone = new AbortController();
+    res.on('close', () => {
+      if (!res.writableFinished) clientGone.abort();
+    });
+    // End the response of a request whose client has gone: the x402
+    // middleware waits for res.end() before it can finish (and it then
+    // cancels settlement because of the status).
+    const endGone = () => {
+      if (!res.writableEnded) res.status(499).end();
+    };
     if (!req.is('application/json')) {
       return res.status(415).json(errBody(req, 'Unsupported Media Type', 'Content-Type must be application/json'));
     }
@@ -203,23 +258,23 @@ export async function createApp(config, deps = {}) {
       throw err;
     }
 
-    const bad = await precheckUrl(params.url, { lookup: deps.net?.lookup, allowedPorts: config.allowedPorts, extraDeny: config.extraDeny });
+    const bad = await precheckUrl(params.url, {
+      lookup: deps.net?.lookup,
+      allowedPorts: config.allowedPorts,
+      extraDeny: config.extraDeny,
+      dns: { timeoutMs: config.precheckDnsTimeoutMs, tries: config.dns.tries },
+    });
+    if (clientGone.signal.aborted) return endGone();
     if (bad) {
       rlog.info('precheck refused', { url: params.url, reason: bad });
       return res.status(400).json(errBody(req, 'Forbidden URL', bad));
     }
 
-    // Abort everything when the client goes away.
-    const clientGone = new AbortController();
-    res.on('close', () => {
-      if (!res.writableFinished) clientGone.abort();
-    });
-
     let release;
     try {
       release = await gate.acquire(clientGone.signal);
     } catch (err) {
-      if (clientGone.signal.aborted) return;
+      if (clientGone.signal.aborted) return endGone();
       if (err instanceof QueueFullError || err instanceof QueueTimeoutError) {
         res.setHeader('Retry-After', '10');
         return res.status(503).json(errBody(req, 'Service busy', 'All capture slots are busy. Retry later.'));
@@ -233,8 +288,9 @@ export async function createApp(config, deps = {}) {
       stats.captures++;
       stats.totalBytes += result.size;
       rlog.info('capture ok', { url: params.url, bytes: result.size, ms: result.durationMs, egress: result.egress, clipped: result.clipped });
-      res.json({
-        screenshot: result.screenshot.toString('base64'),
+      // Build the JSON around the (large) base64 string directly instead of
+      // JSON.stringify-ing an object that contains it, and send one Buffer.
+      const rest = JSON.stringify({
         finalUrl: result.finalUrl,
         title: result.title,
         size: result.size,
@@ -244,10 +300,14 @@ export async function createApp(config, deps = {}) {
         clipped: result.clipped,
         requestId: req.id,
       });
+      const body = Buffer.from(`{"screenshot":"${result.screenshotBase64}",${rest.slice(1)}`);
+      res.status(200).type('application/json').send(body);
     } catch (err) {
       const code = err instanceof CaptureError ? err.code : 'INTERNAL';
       rlog.warn('capture failed', { url: params.url, code, err: err?.message, cause: err?.cause?.message });
-      if (code === 'ABORTED' || res.headersSent) return;
+      if (code === 'ABORTED') return endGone();
+      if (res.headersSent) return;
+      if (code === 'TOO_LARGE') return res.status(422).json(errBody(req, 'Screenshot too large', `The screenshot exceeds the ${config.maxPngBytes}-byte limit; use a smaller viewport or fullPage=false`));
       if (code === 'TIMEOUT') return res.status(504).json(errBody(req, 'Capture timed out', `The capture did not finish within ${config.captureTimeoutMs} ms`));
       if (code === 'FORBIDDEN_DESTINATION') return res.status(400).json(errBody(req, 'Forbidden URL', 'The page redirected to a forbidden destination'));
       if (code === 'NAVIGATION_FAILED') return res.status(502).json(errBody(req, 'Failed to load page', 'The page could not be loaded'));

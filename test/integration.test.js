@@ -95,6 +95,20 @@ before(async () => {
             'Infinite',
           ),
         );
+      case '/noise':
+        // Incompressible content: random pixels on a tall canvas.
+        return send(
+          page(
+            `<canvas id="c" width="1000" height="6000"></canvas><script>
+              const c = document.getElementById('c').getContext('2d');
+              const img = c.createImageData(1000, 6000);
+              for (let i = 0; i < img.data.length; i += 65536) crypto.getRandomValues(img.data.subarray(i, i + 65536));
+              for (let i = 3; i < img.data.length; i += 4) img.data[i] = 255;
+              c.putImageData(img, 0, 0);
+            </script><style>body{margin:0}</style>`,
+            'Noise',
+          ),
+        );
       case '/tall':
         return send(page('<div style="height:50000px;background:linear-gradient(red,blue)"></div>', 'Tall'));
       case '/hang':
@@ -333,5 +347,26 @@ itest('Chrome sandbox is active when CHROME_SANDBOX=true (renderers in their own
       assert.notEqual(p.userns, sandboxProbe.mine, 'renderer in a separate user namespace');
       assert.notEqual(p.pidns, sandboxProbe.mypid, 'renderer in a separate pid namespace');
     }
+  });
+});
+
+itest('pixel budget: a tall page is clipped to MAX_SCREENSHOT_PIXELS / width', async () => {
+  await withService({ maxScreenshotPixels: 2_000_000 }, async (base) => {
+    const r = await shoot(base, { url: `http://site.public.test:${P}/noise`, waitFor: 0, viewportWidth: 1000, viewportHeight: 600 });
+    const j = await r.json();
+    assert.equal(r.status, 200, JSON.stringify(j).slice(0, 200));
+    assert.equal(j.clipped, true);
+    assert.equal(j.height, 2000);
+    assert.deepEqual(pngSize(Buffer.from(j.screenshot, 'base64')), { width: 1000, height: 2000 });
+  });
+});
+
+itest('PNG byte cap: an incompressible screenshot over MAX_PNG_BYTES gets 422', async () => {
+  await withService({ maxPngBytes: 500_000 }, async (base) => {
+    const r = await shoot(base, { url: `http://site.public.test:${P}/noise`, waitFor: 0, viewportWidth: 1000, viewportHeight: 600 });
+    const j = await r.json();
+    assert.equal(r.status, 422, JSON.stringify(j).slice(0, 200));
+    assert.equal(j.error, 'Screenshot too large');
+    assert.ok(await waitForNoChrome());
   });
 });
