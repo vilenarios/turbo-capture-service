@@ -5,6 +5,7 @@
  */
 
 import { resolveAndValidate } from './egress-proxy.js';
+import { createBoundedResolver } from './resolver.js';
 
 export const LIMITS = {
   urlMaxLength: 2048,
@@ -76,17 +77,30 @@ export function validateBody(body) {
 
 /**
  * Fast pre-check of the top-level URL using the same rules as the proxy.
+ * Without an injected lookup (tests only) it uses its own short-lived bounded
+ * resolver, so a slow nameserver delays only this request, and only up to
+ * the DNS timeout.
+ *
+ * @param {string} url
+ * @param {object} opts
+ * @param {Function} [opts.lookup] resolver override (tests only)
+ * @param {Set<number>|null} [opts.allowedPorts]
+ * @param {Array} [opts.extraDeny]
+ * @param {object} [opts.dns] bounded-resolver options (timeoutMs, tries, servers)
  * @returns {Promise<null|string>} null when OK, otherwise a client-safe reason
  */
-export async function precheckUrl(url, { lookup, allowedPorts, extraDeny }) {
+export async function precheckUrl(url, { lookup, allowedPorts = null, extraDeny = [], dns = {} } = {}) {
   const u = new URL(url);
   const port = u.port ? Number(u.port) : u.protocol === 'https:' ? 443 : 80;
+  const resolver = lookup ? null : createBoundedResolver({ timeoutMs: 3_000, tries: 2, maxConcurrent: 2, maxQueue: 0, ...dns });
   try {
-    await resolveAndValidate(u.hostname, port, { lookup, allowedPorts, extraDeny });
+    await resolveAndValidate(u.hostname, port, { lookup: lookup ?? resolver.lookup, allowedPorts, extraDeny });
     return null;
   } catch (err) {
     if (err.status === 502) return 'The host name could not be resolved';
     if (/port/.test(err.message)) return 'This port is not allowed';
     return 'Cannot capture localhost, private-network or reserved addresses';
+  } finally {
+    resolver?.cancel();
   }
 }

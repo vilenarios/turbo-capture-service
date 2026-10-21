@@ -1,6 +1,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import net from 'node:net';
 import { startEgressProxy, BLOCKED_HEADER } from '../src/egress-proxy.js';
 import { listen, close, startTrap, fakeNet, FAKE_PUBLIC_IP } from './helpers/net.js';
 
@@ -214,4 +215,25 @@ test('close() tears down open tunnels', async () => {
   const closed = new Promise((resolve) => c.socket.on('close', resolve));
   await proxy.close();
   await closed;
+});
+
+test('a dial that completes after close() is destroyed, not left open', async () => {
+  const dialled = [];
+  const slowDial = (ip, port) => {
+    const s = new net.Socket();
+    dialled.push(s);
+    setTimeout(() => s.connect({ host: '127.0.0.1', port: fixturePort }), 400);
+    return s;
+  };
+  const n = fakeNet({ fixturePort });
+  const proxy = await startEgressProxy({ lookup: n.lookup, dial: slowDial });
+  const pending = connect(proxy, `site.public.test:${fixturePort}`).catch(() => null);
+  const httpPending = proxied(proxy, `http://site.public.test:${fixturePort}/`).catch(() => null);
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(dialled.length, 2);
+  await proxy.close();
+  await new Promise((r) => setTimeout(r, 800));
+  for (const s of dialled) assert.equal(s.destroyed, true, 'late upstream socket destroyed');
+  await pending;
+  await httpPending;
 });

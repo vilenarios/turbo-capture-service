@@ -5,7 +5,9 @@
  * For each request the proxy:
  *   1. requires the per-proxy secret (Proxy-Authorization: Basic),
  *   2. refuses non-allowed ports and forbidden host names,
- *   3. resolves the host ONCE (all A/AAAA records),
+ *   3. resolves the host ONCE (all A/AAAA records) through a bounded
+ *      per-proxy DNS resolver (c-ares; timeout, concurrency cap, cancelled
+ *      on close; DNS only, /etc/hosts is not consulted),
  *   4. refuses the request if ANY resolved address is non-public,
  *   5. connects to the exact validated IP (no second lookup, so no DNS
  *      rebinding window between check and use).
@@ -16,17 +18,11 @@
 
 import http from 'node:http';
 import net from 'node:net';
-import dns from 'node:dns';
 import crypto from 'node:crypto';
 import { isPublicAddress, isForbiddenHostname, normalizeHost } from './address.js';
+import { createBoundedResolver } from './resolver.js';
 
 export const BLOCKED_HEADER = 'x-capture-blocked';
-
-/** Default resolver: getaddrinfo for all A/AAAA records. */
-export async function defaultLookup(host) {
-  const res = await dns.promises.lookup(host, { all: true, verbatim: true });
-  return res.map((r) => r.address);
-}
 
 /** Default dialer: TCP connect to an already-validated IP. */
 export function defaultDial(ip, port) {
@@ -61,7 +57,7 @@ class Refusal extends Error {
  * @param {object} opts
  */
 export async function resolveAndValidate(rawHost, port, opts) {
-  const { lookup = defaultLookup, allowedPorts = null, extraDeny = [] } = opts;
+  const { lookup, allowedPorts = null, extraDeny = [] } = opts;
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Refusal('invalid port', 400);
 
   // Re-parse through the WHATWG URL parser so numeric/hex/octal IPv4 forms
@@ -97,13 +93,16 @@ export async function resolveAndValidate(rawHost, port, opts) {
   return { host, addresses: [...v4, ...v6] };
 }
 
-function dialFirst(addresses, port, dial, connectTimeoutMs) {
+function dialFirst(addresses, port, dial, connectTimeoutMs, { isClosed, track }) {
   return new Promise((resolve, reject) => {
     let i = 0;
     const tryNext = (lastErr) => {
+      if (isClosed()) return reject(new Error('proxy closed'));
       if (i >= addresses.length) return reject(lastErr ?? new Error('connect failed'));
       const ip = addresses[i++];
       const sock = dial(ip, port);
+      // Tracked from the start, so close() also destroys dials in progress.
+      track(sock);
       const timer = setTimeout(() => sock.destroy(new Error('connect timeout')), connectTimeoutMs);
       const onError = (err) => {
         clearTimeout(timer);
@@ -114,6 +113,10 @@ function dialFirst(addresses, port, dial, connectTimeoutMs) {
       const onConnect = () => {
         clearTimeout(timer);
         sock.removeListener('error', onError);
+        if (isClosed()) {
+          sock.destroy();
+          return reject(new Error('proxy closed'));
+        }
         resolve({ sock, ip });
       };
       sock.once('error', onError);
@@ -127,17 +130,20 @@ function dialFirst(addresses, port, dial, connectTimeoutMs) {
  * Start a proxy. Returns { port, username, password, close(), blocked, stats }.
  *
  * @param {object} opts
- * @param {(host: string) => Promise<string[]>} [opts.lookup] resolver (tests inject one)
+ * @param {(host: string) => Promise<string[]>} [opts.lookup] resolver override (tests only)
+ * @param {object} [opts.dns] options for the default bounded resolver (see resolver.js)
  * @param {(ip: string, port: number) => net.Socket} [opts.dial] dialer (tests inject one)
  * @param {Set<number>|null} [opts.allowedPorts] null = any port
  * @param {Array} [opts.extraDeny] parsed extra CIDRs
  * @param {number} [opts.connectTimeoutMs]
- * @param {number} [opts.maxBytes] total bytes (both directions) before tunnels are cut
+ * @param {number} [opts.maxBytes] bytes received from upstream servers (all
+ *   connections of this proxy together) before every connection is cut
  * @param {(event: object) => void} [opts.onEvent] log hook
  */
 export async function startEgressProxy(opts = {}) {
   const {
-    lookup = defaultLookup,
+    lookup: lookupOverride,
+    dns: dnsOpts = {},
     dial = defaultDial,
     allowedPorts = null,
     extraDeny = [],
@@ -148,6 +154,8 @@ export async function startEgressProxy(opts = {}) {
   const username = 'capture';
   const password = crypto.randomBytes(24).toString('hex');
   const expectedAuth = 'Basic ' + Buffer.from(`${username}:${password}`).toString('base64');
+  const resolver = lookupOverride ? null : createBoundedResolver(dnsOpts);
+  const lookup = lookupOverride ?? resolver.lookup;
   const vOpts = { lookup, allowedPorts, extraDeny };
 
   /** host:port strings the proxy refused (used to explain navigation failures). */
@@ -169,6 +177,8 @@ export async function startEgressProxy(opts = {}) {
       }
     });
   };
+
+  const dialCtx = { isClosed: () => closed, track: (x) => track(x) };
 
   const authOk = (req) => {
     const got = req.headers['proxy-authorization'];
@@ -220,13 +230,17 @@ export async function startEgressProxy(opts = {}) {
 
     let upstreamSock;
     try {
-      ({ sock: upstreamSock } = await dialFirst(validated.addresses, port, dial, connectTimeoutMs));
+      ({ sock: upstreamSock } = await dialFirst(validated.addresses, port, dial, connectTimeoutMs, dialCtx));
     } catch (err) {
       onEvent({ type: 'connect-failed', host: validated.host, port, reason: err.message });
       res.writeHead(502, { 'Content-Length': 0 });
       return res.end();
     }
-    track(upstreamSock);
+    if (closed) {
+      // close() ran while we were dialling: never leave the upstream open.
+      upstreamSock.destroy();
+      return res.destroy();
+    }
     countBytes(upstreamSock);
     stats.allowed++;
 
@@ -285,13 +299,17 @@ export async function startEgressProxy(opts = {}) {
     if (closed) return clientSock.destroy();
     let upstreamSock;
     try {
-      ({ sock: upstreamSock } = await dialFirst(validated.addresses, port, dial, connectTimeoutMs));
+      ({ sock: upstreamSock } = await dialFirst(validated.addresses, port, dial, connectTimeoutMs, dialCtx));
     } catch (err) {
       onEvent({ type: 'connect-failed', host: validated.host, port, reason: err.message });
       clientSock.end('HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n');
       return;
     }
-    track(upstreamSock);
+    if (closed) {
+      // close() ran while we were dialling: never leave the upstream open.
+      upstreamSock.destroy();
+      return clientSock.destroy();
+    }
     countBytes(upstreamSock);
     stats.allowed++;
     upstreamSock.on('error', () => clientSock.destroy());
@@ -323,8 +341,10 @@ export async function startEgressProxy(opts = {}) {
     password,
     blocked,
     stats,
+    dnsStats: () => resolver?.stats() ?? { active: 0, queued: 0, cancelled: closed },
     async close() {
       closed = true;
+      resolver?.cancel();
       for (const s of sockets) s.destroy();
       await new Promise((resolve) => server.close(() => resolve()));
     },
