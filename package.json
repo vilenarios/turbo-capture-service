@@ -1,12 +1,17 @@
 {
   "name": "turbo-capture-service",
-  "version": "0.0.1",
-  "description": "Turbo Capture Service backend using Puppeteer",
+  "version": "0.1.0",
+  "description": "Turbo Capture Service: headless Chrome screenshot API with egress containment",
   "type": "module",
   "main": "server.js",
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "test": "node --test --test-concurrency=1 'test/*.test.js'",
+    "test:unit": "node --test test/address.test.js test/egress-proxy.test.js test/config.test.js test/validate.test.js test/concurrency.test.js test/app.test.js"
   },
   "keywords": [
     "puppeteer",
@@ -19,14 +24,19 @@
   "author": "",
   "license": "AGPL-3.0",
   "dependencies": {
-    "cors": "^2.8.5",
-    "express": "^5.1.0",
-    "express-rate-limit": "^8.1.0",
-    "helmet": "^8.1.0",
-    "puppeteer": "^24.25.0",
+    "@x402/core": "^2.28.0",
+    "@x402/evm": "^2.28.0",
+    "@x402/express": "^2.28.0",
+    "@x402/extensions": "^2.28.0",
+    "cors": "^2.8.6",
+    "express": "^5.3.0",
+    "express-rate-limit": "^8.7.1",
+    "helmet": "^8.3.0",
+    "ipaddr.js": "^2.5.0",
+    "puppeteer": "^25.15.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
     "swagger-ui-express": "^5.0.1",
-    "yaml": "^2.8.1"
+    "yaml": "^2.9.1"
   }
 }
