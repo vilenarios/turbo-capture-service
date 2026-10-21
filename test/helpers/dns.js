@@ -1,7 +1,10 @@
 /**
  * A tiny fake DNS server for tests (UDP, 127.0.0.1 only).
  *
- * zones: { name: { A?: string[], AAAA?: string[], CNAME?: string, nx?: true, blackhole?: true } }
+ * zones: { name: { A?: string[], AAAA?: string[], CNAME?: string, nx?: true, blackhole?: true,
+ *                  fail?: { A?: Failure, AAAA?: Failure } } }
+ * Failure (per query type): 'blackhole' (never answer), 'SERVFAIL', 'REFUSED',
+ * or 'TRUNCATED' (TC bit, no answers; the fake has no TCP listener).
  * Names ending in a key that starts with "*." match as wildcards.
  * Unknown names answer NXDOMAIN. Blackholed names swallow the query.
  */
@@ -73,7 +76,16 @@ export async function startFakeDns(zones, { port = 0 } = {}) {
     if (zone?.blackhole) return; // never answer
     const answers = [];
     let rcode = 0;
-    if (!zone || zone.nx) {
+    let flags = 0x8180; // QR, RD, RA
+    const failure = zone?.fail?.[qtype === 1 ? 'A' : qtype === 28 ? 'AAAA' : '?'];
+    if (failure === 'blackhole') return;
+    if (failure === 'SERVFAIL') {
+      rcode = 2;
+    } else if (failure === 'REFUSED') {
+      rcode = 5;
+    } else if (failure === 'TRUNCATED') {
+      flags |= 0x0200; // TC
+    } else if (!zone || zone.nx) {
       rcode = 3;
     } else {
       let target = q.name;
@@ -89,7 +101,7 @@ export async function startFakeDns(zones, { port = 0 } = {}) {
     }
     const header = Buffer.alloc(12);
     msg.copy(header, 0, 0, 2); // id
-    header.writeUInt16BE(0x8180 | rcode, 2); // QR, RD, RA, rcode
+    header.writeUInt16BE(flags | rcode, 2);
     header.writeUInt16BE(1, 4);
     header.writeUInt16BE(answers.length, 6);
     sock.send(Buffer.concat([header, msg.subarray(12, q.end + 4), ...answers]), rinfo.port, rinfo.address);

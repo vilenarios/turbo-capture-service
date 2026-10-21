@@ -30,7 +30,6 @@ const ZONES = {
   'target.test': { A: ['11.22.33.45'] },
   'alias-private.test': { CNAME: 'inside.test' },
   'inside.test': { A: ['192.168.1.10'] },
-  'aaaa-hangs.test': { A: ['11.22.33.44'] }, // AAAA handled below
 };
 
 let fixture;

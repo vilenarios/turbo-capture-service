@@ -30,7 +30,15 @@ const ZONES = {
   'target.test': { A: ['11.22.33.45'] },
   'alias-private.test': { CNAME: 'inside.test' },
   'inside.test': { A: ['192.168.1.10'] },
-  'aaaa-hangs.test': { A: ['11.22.33.44'] }, // AAAA handled below
+  'cname-only.test': { CNAME: 'dangling.test' }, // CNAME with no address records
+  // One record type answers, the other fails: the lookup must fail.
+  'a-ok-aaaa-timeout.test': { A: ['11.22.33.44'], fail: { AAAA: 'blackhole' } },
+  'a-ok-aaaa-servfail.test': { A: ['11.22.33.44'], fail: { AAAA: 'SERVFAIL' } },
+  'a-ok-aaaa-refused.test': { A: ['11.22.33.44'], fail: { AAAA: 'REFUSED' } },
+  'a-ok-aaaa-truncated.test': { A: ['11.22.33.44'], fail: { AAAA: 'TRUNCATED' } },
+  'aaaa-ok-a-timeout.test': { AAAA: ['2606:4700::1111'], fail: { A: 'blackhole' } },
+  'aaaa-ok-a-servfail.test': { AAAA: ['2606:4700::1111'], fail: { A: 'SERVFAIL' } },
+  'aaaa-ok-a-refused.test': { AAAA: ['2606:4700::1111'], fail: { A: 'REFUSED' } },
 };
 
 let fixture;
@@ -42,7 +50,7 @@ before(async () => {
 after(() => close(fixture));
 
 const dialToFixture = (ip, port) => {
-  if (ip === '11.22.33.44' || ip === '11.22.33.45') return net.connect({ host: '127.0.0.1', port: fixturePort });
+  if (['11.22.33.44', '11.22.33.45', '2606:4700::1111'].includes(ip)) return net.connect({ host: '127.0.0.1', port: fixturePort });
   const s = new net.Socket();
   process.nextTick(() => s.destroy(new Error(`test dialer refused ${ip}`)));
   return s;
@@ -116,7 +124,7 @@ test('resolver: a lookup against a silent nameserver times out within the bound'
     const t0 = Date.now();
     await assert.rejects(r.lookup('x.blackhole.test'), (e) => e.code === 'ETIMEOUT');
     const ms = Date.now() - t0;
-    assert.ok(ms >= 500 && ms < 1_500, `took ${ms} ms`);
+    assert.ok(ms < 1_000, `took ${ms} ms (bound 600)`);
   } finally {
     r.cancel();
   }
@@ -203,4 +211,50 @@ test('pre-check uses a bounded resolver with its own short timeout', async () =>
   assert.match(res, /resolved/);
   assert.ok(Date.now() - t0 < 1_500, `took ${Date.now() - t0} ms`);
   assert.equal(await precheckUrl('https://www.ok.test/', { dns: { servers: [fakeDns.server] } }), null);
+});
+
+const PARTIAL = {
+  'a-ok-aaaa-timeout.test': ['ETIMEOUT'],
+  'a-ok-aaaa-servfail.test': ['ESERVFAIL'],
+  'a-ok-aaaa-refused.test': ['EREFUSED'],
+  'a-ok-aaaa-truncated.test': null, // any error (TCP retry is refused)
+  'aaaa-ok-a-timeout.test': ['ETIMEOUT'],
+  'aaaa-ok-a-servfail.test': ['ESERVFAIL'],
+  'aaaa-ok-a-refused.test': ['EREFUSED'],
+};
+
+for (const [name, codes] of Object.entries(PARTIAL)) {
+  test(`resolver: partial answer fails the lookup (${name})`, async () => {
+    const r = mk({ timeoutMs: 2_000, tries: 1 });
+    try {
+      await assert.rejects(r.lookup(name), (e) => (codes ? codes.includes(e.code) : typeof e.code === 'string'));
+    } finally {
+      r.cancel();
+    }
+  });
+
+  test(`proxy: partial answer is refused with 502 (${name})`, async () => {
+    const proxy = await startEgressProxy({ dial: dialToFixture, dns: { servers: [fakeDns.server], timeoutMs: 2_000, tries: 1 } });
+    try {
+      assert.equal((await connectVia(proxy, `${name}:443`)).status, 502);
+      assert.equal(proxy.blocked.size, 0, 'a DNS failure is not recorded as a policy block');
+    } finally {
+      await proxy.close();
+    }
+  });
+}
+
+test('a bare CNAME answer (no addresses) fails the lookup and is refused by the proxy', async () => {
+  const r = mk();
+  try {
+    await assert.rejects(r.lookup('cname-only.test'), (e) => e.code === 'ENODATA' || e.code === 'ENOTFOUND');
+  } finally {
+    r.cancel();
+  }
+  const proxy = await startEgressProxy({ dial: dialToFixture, dns: { servers: [fakeDns.server] } });
+  try {
+    assert.equal((await connectVia(proxy, 'cname-only.test:443')).status, 502);
+  } finally {
+    await proxy.close();
+  }
 });

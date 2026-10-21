@@ -31,8 +31,11 @@ function dnsError(code, message) {
  */
 export function createBoundedResolver(opts = {}) {
   const { servers, timeoutMs = 5_000, tries = 2, maxConcurrent = 6, maxQueue = 64 } = opts;
-  // c-ares per-attempt timeout; the hard timeout below bounds the total.
-  const resolver = new dns.promises.Resolver({ timeout: Math.max(100, Math.floor(timeoutMs / tries)), tries });
+  // c-ares per-attempt timeout. c-ares doubles it on each retry, so
+  // t * (2^tries - 1) < timeoutMs: c-ares reports its own ETIMEOUT (and the
+  // per-family logic below decides) before the hard timeout fires. The hard
+  // timeout still bounds the total.
+  const resolver = new dns.promises.Resolver({ timeout: Math.max(50, Math.floor(timeoutMs / 2 ** tries)), tries });
   if (servers && servers.length > 0) resolver.setServers(servers);
 
   let cancelled = false;
