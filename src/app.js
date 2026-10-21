@@ -285,6 +285,12 @@ export async function createApp(config, deps = {}) {
     try {
       rlog.info('capture start', { url: params.url });
       const result = await captureImpl(params, { config, signal: clientGone.signal, log: rlog, net: deps.net });
+      // The client may have left while Chrome was being torn down: do not send
+      // (and so do not settle a payment for) a result nobody receives.
+      if (clientGone.signal.aborted) {
+        rlog.info('client gone before response', { url: params.url });
+        return endGone();
+      }
       stats.captures++;
       stats.totalBytes += result.size;
       rlog.info('capture ok', { url: params.url, bytes: result.size, ms: result.durationMs, egress: result.egress, clipped: result.clipped });

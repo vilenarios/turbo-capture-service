@@ -45,8 +45,8 @@ Types are strict (`"5000"` is not an integer, `"true"` is not a boolean) and
 unknown fields are rejected.
 
 Response: `screenshot` (base64 PNG), `finalUrl`, `title`, `size`, `capturedAt`,
-`viewport`, `height` (PNG height), `clipped` (page was taller than
-`MAX_SCREENSHOT_HEIGHT`), `requestId`.
+`viewport`, `height` (PNG height), `clipped` (the screenshot was cut to
+`MAX_SCREENSHOT_HEIGHT` or to the pixel budget `MAX_SCREENSHOT_PIXELS`), `requestId`.
 
 | Status | Meaning |
 |---|---|
@@ -139,9 +139,13 @@ per-lookup timeout (`DNS_TIMEOUT_MS`, default 5 s, `DNS_TRIES` attempts), at mos
 `DNS_MAX_CONCURRENT` lookups in flight and `DNS_MAX_QUEUE` waiting (more fail
 immediately); closing the proxy cancels its pending lookups. The top-level
 pre-check uses its own short-lived resolver (`PRECHECK_DNS_TIMEOUT_MS`, default
-3 s). CNAME chains are followed and every final A/AAAA address must be public;
-NXDOMAIN or no records fail the request, and so does a timeout or SERVFAIL for
-either family (the service will not decide on a partial answer). The proxy uses
+3 s). The service does not chase CNAMEs itself: c-ares reads the chain inside the
+recursive resolver's answer and returns the final A/AAAA addresses, every one of
+which must be public. An answer that contains only a CNAME (no addresses) counts
+as "no records". NXDOMAIN or no records for both families fails the request
+(502), and so does a timeout, SERVFAIL, REFUSED or truncated answer for either
+family, even when the other family answered: the service never decides on a
+partial answer. The proxy uses
 DNS only: `/etc/hosts` is not consulted (names like `localhost` are refused by
 name before any lookup), and the nameservers are the container's `resolv.conf`.
 

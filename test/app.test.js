@@ -443,3 +443,31 @@ test('an oversized PNG is refused with a clear error', async () => {
     await s.close();
   }
 });
+
+test('x402: a client that disconnects while the capture finishes is not settled', async () => {
+  const fac = await startFakeFacilitator({ approve: true });
+  const free = stubCapture();
+  let block = false;
+  let started = 0;
+  // Succeeds, but only after the client has gone (teardown outlives the client).
+  const lateSuccess = (params, ctx) =>
+    new Promise((resolve) => {
+      started++;
+      ctx.signal.addEventListener('abort', () => setTimeout(() => resolve({ screenshotBase64: PNG_1x1.toString('base64'), finalUrl: params.url, title: 't', size: PNG_1x1.length, height: 1, clipped: false, egress: {}, durationMs: 1 }), 50), { once: true });
+    });
+  const app = await createApp(x402Config(fac), { log: silentLog, capture: (p, ctx) => (block ? lateSuccess(p, ctx) : free(p, ctx)), net: fakeNet({}) });
+  const s = await startApp(app);
+  try {
+    const pay = await paymentHeader(s.url);
+    block = true;
+    const req = rawPost(s.url, { url: 'https://site.public.test/' }, { 'payment-signature': pay('late') });
+    assert.ok(await until(() => started === 1), 'capture started');
+    req.destroy();
+    assert.ok(await until(() => app.locals.paymentInFlight === 0), 'payment middleware finished');
+    await new Promise((r) => setTimeout(r, 200));
+    assert.ok(!fac.calls.some((c) => c.url.endsWith('/settle')), 'not settled for a client that had gone');
+  } finally {
+    await s.close();
+    await fac.close();
+  }
+});
