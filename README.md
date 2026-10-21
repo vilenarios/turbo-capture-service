@@ -1,491 +1,232 @@
 # Turbo Capture Service
 
-Screenshot capture service using Puppeteer with stealth mode for bot detection evasion.
+Screenshot API: `POST /screenshot` with a URL, get back a base64 PNG rendered by
+headless Chrome (puppeteer with the stealth plugin). Built to be exposed publicly:
+every byte Chrome sends goes through an egress proxy that only talks to public
+addresses, each capture is bounded in time, size and concurrency, and optional
+[x402](https://github.com/coinbase/x402) payments lift the free-tier rate limit.
 
-## Features
+- API docs: `GET /api-docs` (OpenAPI in `openapi.yaml`)
+- Health: `GET /health`
 
-- Full-page screenshot capture
-- Headless Chrome with anti-detection (puppeteer-extra-stealth)
-- Configurable viewport sizes
-- Returns base64-encoded PNG screenshots
-- CORS-enabled for frontend integration
-- **Rate limiting** (1 request/min with x402, 3 requests/min without)
-- **x402 payment protocol** for AI agents to bypass rate limits
-- **Input validation & SSRF protection**
-- **Security headers** (Helmet.js)
-
-## Prerequisites
-
-- Node.js 18+ (for ES modules support)
-- Chrome/Chromium (installed automatically by Puppeteer)
-
-## Installation
+## Quick start (Docker, recommended)
 
 ```bash
-npm install
+cp .env.example .env        # edit it; docker compose reads it via env_file
+docker compose up -d --build
+curl -s localhost:3001/health
+curl -s -X POST localhost:3001/screenshot \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com","waitFor":2000}' | jq -r .screenshot | base64 -d > shot.png
 ```
+
+The compose file binds to `127.0.0.1:3001` (set `BIND_ADDRESS` / `HOST_PORT` to
+change), runs the container read-only with all capabilities dropped,
+`no-new-privileges`, a PID limit, and the seccomp profile that lets Chrome keep its
+sandbox (see below).
+
+Running without Docker needs Node >= 22.12: `npm ci`, then `npm start`
+(puppeteer downloads Chrome on install). The container is the supported setup.
+
+## API
+
+`POST /screenshot` (JSON, at most 10 kB):
+
+| Field | Type | Default | Range |
+|---|---|---|---|
+| `url` | string, http/https only, no credentials | required | ≤ 2048 chars |
+| `waitFor` | integer ms after load | 10000 | 0–30000 |
+| `viewportWidth` | integer px | 1280 | 320–3840 |
+| `viewportHeight` | integer px | 800 | 240–2160 |
+| `fullPage` | boolean | true | |
+| `quality` | integer (ignored, PNG only) | | 1–100 |
+
+Types are strict (`"5000"` is not an integer, `"true"` is not a boolean) and
+unknown fields are rejected.
+
+Response: `screenshot` (base64 PNG), `finalUrl`, `title`, `size`, `capturedAt`,
+`viewport`, `height` (PNG height), `clipped` (page was taller than
+`MAX_SCREENSHOT_HEIGHT`), `requestId`.
+
+| Status | Meaning |
+|---|---|
+| 400 | Invalid input, or the URL / a redirect targets a forbidden destination |
+| 402 | Payment required (x402 enabled, free tier used up, or payment invalid) |
+| 413 / 415 | Body too large / not `application/json` |
+| 429 | Free-tier rate limit (x402 disabled); `Retry-After` |
+| 502 | Page could not be loaded (DNS, connect, TLS) |
+| 503 | All capture slots and the queue are full; `Retry-After` |
+| 504 | Capture exceeded `CAPTURE_TIMEOUT_MS` |
+| 500 | Internal error |
+
+Every response carries `X-Request-Id`; error bodies are
+`{error, message, requestId}` with generic messages. Details (URL, cause, egress
+refusals) are logged server-side as JSON lines under the same id.
 
 ## Configuration
 
-### Environment Variables
+All settings are environment variables, validated at start-up (an invalid value
+stops the service). See `.env.example` for the annotated list.
 
-Create a `.env` file (copy from `.env.example`):
+| Variable | Default | Purpose |
+|---|---|---|
+| `PORT` | 3001 | Listen port |
+| `ALLOWED_ORIGINS` | any | CORS origins, comma-separated |
+| `TRUST_PROXY` | false | Reverse-proxy hops to trust for the client IP (see below) |
+| `RATE_LIMIT_PER_MINUTE` | 3 (1 with x402) | Free-tier requests per client IP per minute |
+| `MAX_CONCURRENT_CAPTURES` | 2 | Captures running at once (each is a full Chrome) |
+| `MAX_QUEUE` | 4 | Requests waiting for a slot; beyond that, 503 |
+| `QUEUE_TIMEOUT_MS` | 30000 | Max wait in the queue before 503 |
+| `CAPTURE_TIMEOUT_MS` | 60000 | Hard deadline per capture (launch → screenshot) |
+| `NAVIGATION_TIMEOUT_MS` | 30000 | Navigation bound (also capped by the deadline) |
+| `MAX_SCREENSHOT_HEIGHT` | 16384 | Full-page screenshots are clipped to this height |
+| `SCROLL_MAX_STEPS` / `SCROLL_MAX_MS` | 40 / 10000 | Lazy-load scroll budget |
+| `MAX_EGRESS_BYTES` | 200 MiB | Download budget per capture |
+| `ALLOWED_PORTS` | 80,443,8080,8443 | Destination ports Chrome may use (`*` = any) |
+| `BLOCKED_CIDRS` | none | Extra ranges to refuse (your own public IPs, LBs, NAT) |
+| `CHROME_SANDBOX` | true | Keep Chrome's sandbox; see "Chrome sandbox" |
+| `ENABLE_X_402` | false | x402 payments |
+| `X_402_WALLET_ADDRESS` | none | Required when x402 is on; start-up fails without it |
+| `X_402_NETWORK` | base | `base`, `base-sepolia` or `eip155:<chainId>` |
+| `X_402_FACILITATOR_URL` | https://facilitator.x402.rs | Must be https |
+| `X_402_PRICE` | $0.01 | Price per capture |
 
-```bash
-cp .env.example .env
-```
+### Running behind a reverse proxy: `TRUST_PROXY`
 
-Edit `.env` with your settings:
+By default `X-Forwarded-For` is ignored and the rate limit keys on the TCP peer.
+Behind nginx or a load balancer that peer is the proxy, so every client shares one
+bucket. Set `TRUST_PROXY` to the number of proxy hops you control: `1` for a single
+nginx or AWS ALB, `2` for CloudFront → ALB. You can instead list the proxy
+addresses/CIDRs (`TRUST_PROXY=10.0.0.0/8`). `true` is refused because it would let
+any client choose its own IP.
 
-```env
-PORT=3001
-ALLOWED_ORIGINS=http://localhost:5175,https://yourdomain.com
-NODE_ENV=production
+## Security model
 
-# x402 Payment Configuration (Optional)
-ENABLE_X_402=true
-X_402_WALLET_ADDRESS=0x26B751183814E6BA865c1B65BC00ab4d5501CE8C
-X_402_NETWORK=base
-X_402_FACILITATOR_URL=https://facilitator.x402.rs
-X_402_PRICE=$0.01
-```
+### Egress containment
 
-**⚠️ IMPORTANT:**
-- Set specific ALLOWED_ORIGINS (don't use `*` in production)
-- Keep your `.env` file secret (it's in `.gitignore`)
-- Replace `X_402_WALLET_ADDRESS` with your own wallet address to receive payments
+Chrome is launched with `--proxy-server=http://127.0.0.1:<port>` and
+`--proxy-bypass-list=<-loopback>`, so all of its traffic (the page, redirects,
+images, iframes, fetch/XHR, WebSockets, beacons, WebRTC TURN) goes through an
+in-process forward proxy (`src/egress-proxy.js`, HTTP + CONNECT). For each
+request the proxy:
 
-## Usage
+1. requires a random per-capture secret (`Proxy-Authorization`), supplied to Chrome
+   through CDP; the proxy listens on 127.0.0.1 only and is closed after the capture;
+2. refuses `localhost`, `*.localhost`, `*.local`, `*.internal`, and ports outside
+   `ALLOWED_PORTS`;
+3. resolves the host once (all A and AAAA records) and refuses the request if any
+   address is not public unicast (`src/address.js`: ipaddr.js `range()` plus explicit
+   lists: 0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.0.0/24, TEST-NETs,
+   192.88.99/24, 192.168/16, 198.18/15, 224/4, 240/4, Azure 168.63.129.16; for IPv6
+   only 2000::/3 minus documentation, Teredo/6to4 and other special ranges, with
+   IPv4-mapped, IPv4-compatible and NAT64 `64:ff9b::/96` addresses judged by their
+   embedded IPv4);
+4. connects to the validated IP, never re-resolving (no DNS-rebinding window).
 
-### Start the server
+Other Chrome flags back this up: QUIC off, WebRTC limited to proxied TCP,
+`--host-resolver-rules=MAP * ~NOTFOUND` (Chrome cannot resolve names itself), DNS
+prefetch and background networking off, service workers bypassed, downloads denied.
+Hex, octal and integer IPv4 forms (`0x7f.1`, `2130706433`) are normalised by the URL
+parser before classification.
 
-```bash
-npm start
-```
+The top-level URL also gets a fast pre-check with the same rules, for an immediate
+`400`. A redirect, or a JavaScript navigation, to a refused destination fails the
+capture deterministically with `400 Forbidden URL`.
 
-Or with auto-reload during development:
+The port allow-list (80, 443, 8080, 8443) keeps the service from being used as a
+port scanner or to talk to non-web services on public hosts. Widen it with
+`ALLOWED_PORTS` if you must.
 
-```bash
-npm run dev
-```
+**Defence in depth: restrict egress at the network layer too.** The proxy is the
+enforcement point, but deploy so that a bug in it is not fatal:
 
-The server will run on `http://localhost:3001`
+- Run in a subnet / security group whose egress allows only TCP 80/443 to the
+  internet (via NAT) and nothing to the VPC CIDR, peered networks or on-prem ranges.
+- Block the instance metadata service from the container: on EC2 require IMDSv2
+  with hop limit 1, and on ECS-on-EC2 with `awsvpc` set `ECS_AWSVPC_BLOCK_IMDS=true`.
+  Fargate has no IMDS; its task metadata endpoint (169.254.170.2) is link-local and
+  refused by the proxy. On Kubernetes use a NetworkPolicy denying
+  `169.254.0.0/16` and the cluster/VPC CIDRs.
+- Give the task role no permissions beyond what the service needs (none).
+- Add your NAT gateway / load balancer public IPs and any public-IP internal
+  services to `BLOCKED_CIDRS`.
 
-### API Endpoints
+### Chrome sandbox
 
-#### Health Check
-```
-GET /health
-```
+Chrome keeps its sandbox (no `--no-sandbox`). Its namespace sandbox needs to create
+an unprivileged user namespace and chroot its renderers, which Docker's default
+seccomp profile only allows for containers with `CAP_SYS_ADMIN`.
+`seccomp/chrome.json` is Docker's default profile plus one rule allowing `clone`,
+`unshare`, `setns` and `chroot`, so the container still runs with **no
+capabilities** (`cap_drop: ALL`) and `no-new-privileges`. Regenerate it with
+`node scripts/make-seccomp.mjs <moby default.json> > seccomp/chrome.json`.
 
-Response:
-```json
-{
-  "status": "ok",
-  "service": "puppeteer-screenshot"
-}
-```
+At start-up the service launches Chrome once; if the sandbox cannot start it exits
+with an explanation. Where a custom seccomp profile cannot be applied (e.g. AWS
+Fargate), or the host forbids unprivileged user namespaces, set
+`CHROME_SANDBOX=false` as a last resort and rely on the container boundary:
+read-only root, `cap_drop: ALL`, `no-new-privileges`, PID and memory limits, a
+fresh Chrome profile per capture, and the network-level egress restrictions above.
 
-#### Screenshot Capture
-```
-POST /screenshot
-```
+### Bounded work
 
-Request headers:
-```
-Content-Type: application/json
-```
+- `MAX_CONCURRENT_CAPTURES` captures run at once; `MAX_QUEUE` more may wait up to
+  `QUEUE_TIMEOUT_MS`; otherwise `503` + `Retry-After`. Paid requests count too.
+- One deadline (`CAPTURE_TIMEOUT_MS`) covers launch, navigation, `waitFor`, the
+  scroll pass and the screenshot. On expiry Chrome's process group is killed.
+- The scroll pass is bounded by steps and time, so infinite-scroll pages finish.
+- Full-page screenshots are clipped to `MAX_SCREENSHOT_HEIGHT`.
+- If the client disconnects, the capture is aborted and Chrome killed.
+- Chrome runs under `tini`; a reaper kills any Chrome process that outlives its
+  browser.
 
-Request body:
-```json
-{
-  "url": "https://example.com",
-  "waitFor": 5000,
-  "viewportWidth": 1280,
-  "viewportHeight": 800,
-  "fullPage": true,
-  "quality": 90
-}
-```
+## x402 payments
 
-Response:
-```json
-{
-  "screenshot": "base64-encoded-png-data",
-  "finalUrl": "https://example.com",
-  "title": "Page Title",
-  "size": 123456,
-  "capturedAt": "2025-10-16T...",
-  "viewport": { "width": 1280, "height": 800 }
-}
-```
+With `ENABLE_X_402=true` (and a valid `X_402_WALLET_ADDRESS`, or the service refuses
+to start), clients within the free tier are served as usual. Over the free tier
+they receive `402 Payment Required` with the x402 v2 `PAYMENT-REQUIRED` header, and
+may retry with a `PAYMENT-SIGNATURE` header produced by an x402 v2 client (e.g.
+`@x402/fetch`). A request carrying a payment header skips the free-tier limiter but
+goes straight to payment verification: garbage or invalid payments get `402` and no
+capture runs. Payment is settled only after a successful capture; a capture that
+fails, times out or is refused for capacity (`503`) is not charged.
 
-**Example with curl:**
-```bash
-curl -X POST http://localhost:3001/screenshot \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com"}'
-```
+The service uses the x402 v2 packages (`@x402/express`, `@x402/core`, `@x402/evm`).
+x402 v1 `X-PAYMENT` headers are no longer accepted. Make sure the facilitator you
+configure supports x402 v2 and your network.
 
-**Rate Limit:** 1 request per minute per IP (when x402 enabled), or 3 requests per minute (x402 disabled)
+## Deployment
 
-## x402 Payment Protocol for AI Agents
+- **Behind nginx** on the same host: `proxy_pass http://127.0.0.1:3001/;`, timeouts
+  of at least `CAPTURE_TIMEOUT_MS + QUEUE_TIMEOUT_MS` (default 90 s; use 120 s),
+  `TRUST_PROXY=1`, and do not add CORS headers in nginx.
+- **Cloud (ECS / Kubernetes)**: build the `production` target, 2 GB memory per two
+  concurrent captures, read-only root filesystem with a writable `/tmp`, drop all
+  capabilities, apply `seccomp/chrome.json` where the platform allows it
+  (Kubernetes: `seccompProfile: Localhost`), set `TRUST_PROXY` to the number of load
+  balancer hops, and restrict egress as described above.
 
-This service supports the [x402 payment protocol](https://github.com/coinbase/x402), enabling AI agents to bypass rate limits by paying per request.
+## Development and tests
 
-### How it Works
-
-1. **Free Tier:** 1 request per minute per IP address
-2. **Paid Tier:** Pay $0.01 per screenshot to bypass rate limit using cryptocurrency (USDC on Base)
-
-### Enabling x402
-
-Set in your `.env` file:
-```env
-ENABLE_X_402=true
-X_402_WALLET_ADDRESS=your_wallet_address_here
-X_402_NETWORK=base
-X_402_PRICE=$0.01
-```
-
-### x402 Request Flow
-
-#### Step 1: Initial Request (Rate Limited)
-```bash
-curl -X POST http://localhost:3001/screenshot \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com"}'
-```
-
-**Response (402 Payment Required):**
-```json
-{
-  "error": "Payment Required",
-  "message": "Rate limit exceeded. Pay $0.01 via x402 to continue.",
-  "payment": {
-    "price": "$0.01",
-    "network": "base",
-    "walletAddress": "0x26B751183814E6BA865c1B65BC00ab4d5501CE8C"
-  }
-}
-```
-
-#### Step 2: Sign Payment and Retry
-
-AI agents use x402 client libraries to sign the payment and retry:
+All tooling runs in containers:
 
 ```bash
-# Retry with X-PAYMENT header containing payment proof
-curl -X POST http://localhost:3001/screenshot \
-  -H "Content-Type: application/json" \
-  -H "X-PAYMENT: <payment_proof_from_x402_client>" \
-  -d '{"url": "https://example.com"}'
+# unit + integration tests (real Chrome, local fixtures only, no network)
+docker build --target test -t turbo-capture:test .
+docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges \
+  --security-opt seccomp=$PWD/seccomp/chrome.json --read-only --tmpfs /tmp \
+  turbo-capture:test
+
+# smoke test against https://example.com (needs outbound HTTPS)
+docker run --rm --cap-drop ALL --security-opt seccomp=$PWD/seccomp/chrome.json \
+  --read-only --tmpfs /tmp -e SMOKE=1 turbo-capture:test node --test test/smoke.test.js
 ```
 
-**Response (200 Success):**
-Screenshot captured successfully, bypassing rate limit.
-
-### x402 Client Libraries
-
-For AI agents and developers:
-- **JavaScript/TypeScript:** `npm install @coinbase/x402-client`
-- **Python:** `pip install x402-client`
-
-**Example (Node.js):**
-```javascript
-import { createPayment } from '@coinbase/x402-client';
-
-try {
-  // Initial request
-  const response = await fetch('http://localhost:3001/screenshot', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ url: 'https://example.com' })
-  });
-
-  if (response.status === 402) {
-    // Payment required
-    const paymentRequest = await response.json();
-
-    // Sign payment with wallet
-    const payment = await createPayment(paymentRequest, wallet);
-
-    // Retry with payment proof
-    const paidResponse = await fetch('http://localhost:3001/screenshot', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-PAYMENT': payment.proof
-      },
-      body: JSON.stringify({ url: 'https://example.com' })
-    });
-
-    const screenshot = await paidResponse.json();
-  }
-} catch (error) {
-  console.error('Error:', error);
-}
-```
-
-### Benefits for AI Agents
-
-- **No waiting:** Bypass rate limits instantly with micropayments
-- **Pay-per-use:** Only pay when needed ($0.01 per screenshot)
-- **Automated:** x402 client libraries handle payment signing
-- **Discoverable:** Service appears in [x402 Bazaar](https://bazaar.x402.org) for AI agent discovery
-
-## Environment Variables
-
-- `PORT` - Server port (default: 3001)
-
-## Security Features
-
-### 1. Rate Limiting
-- **Free tier:** 1 request per minute per IP (when x402 enabled), or 3 requests per minute (x402 disabled)
-- **Paid tier:** Bypass via x402 payment ($0.01 per screenshot)
-- Prevents abuse and resource exhaustion
-- Primary defense against malicious use
-- Configurable in `server.js`
-
-### 2. Input Validation
-- URL format validation
-- Protocol whitelist (HTTP/HTTPS only)
-- **SSRF protection** (blocks localhost, private IPs: 192.168.x.x, 10.x.x.x, 172.x.x.x)
-- Viewport dimension limits (320x240 to 3840x2160)
-- Wait time limits (0-30000ms)
-
-### 3. Security Headers (Helmet.js)
-- X-Content-Type-Options: nosniff
-- X-Frame-Options: DENY
-- X-XSS-Protection: 1; mode=block
-- Strict-Transport-Security
-- And more...
-
-### 4. CORS Configuration
-- Configurable allowed origins via `ALLOWED_ORIGINS` env var
-- Prevents unauthorized cross-origin requests
-- Set to specific domains in production
-
-## Technical Details
-
-### Anti-Detection
-
-This server uses `puppeteer-extra-stealth` to evade bot detection on sites like Twitter, Instagram, etc. The stealth plugin:
-
-- Hides the `navigator.webdriver` property
-- Mocks the Chrome object and APIs
-- Spoofs permissions API
-- Prevents browser fingerprinting
-- And many more techniques
-
-### Screenshot Process
-
-1. **Validate** request (API key, rate limit, input)
-2. Launch headless Chrome with stealth mode
-3. Navigate to target URL
-4. Wait for network idle (JavaScript execution complete)
-5. Wait additional time for lazy-loading content
-6. Capture full-page PNG screenshot
-7. Return base64-encoded data
-
-## Docker Deployment
-
-### Build and run with Docker Compose (recommended)
-
-```bash
-docker-compose up -d
-```
-
-The service will be available at `http://localhost:3001`
-
-### Build Docker image manually
-
-```bash
-docker build -t permaweb-capture-backend .
-```
-
-### Run Docker container
-
-```bash
-docker run -d \
-  --name permaweb-capture-backend \
-  -p 3001:3001 \
-  --restart unless-stopped \
-  permaweb-capture-backend
-```
-
-### Docker features
-
-- ✅ Multi-stage build for smaller image size
-- ✅ Runs as non-root user for security
-- ✅ Health checks included
-- ✅ Resource limits configurable
-- ✅ All Chrome dependencies pre-installed
-
-### Check container health
-
-```bash
-docker ps
-# Look for "healthy" status
-
-# Or check health endpoint directly
-curl http://localhost:3001/health
-```
-
-### View logs
-
-```bash
-docker logs -f permaweb-capture-backend
-```
-
-### Stop container
-
-```bash
-docker-compose down
-# or
-docker stop permaweb-capture-backend
-```
-
-## Production Deployment
-
-### Deploying on an ar.io Gateway
-
-If you're running an ar.io gateway and want to host the capture service on the same server, you can use nginx to route requests to the backend.
-
-#### 1. Install and Start Backend
-
-```bash
-# Clone the repository
-git clone https://github.com/vilenarios/turbo-capture-service.git
-cd turbo-capture-service
-
-# Install dependencies
-npm install
-
-# IMPORTANT: Install Chrome for Puppeteer
-npx puppeteer browsers install chrome
-
-# Create .env file
-cp .env.example .env
-nano .env  # Edit with your settings
-
-# Start the service (use PM2 or systemd for production)
-npm start
-
-# Or use PM2 for process management
-npm install -g pm2
-pm2 start server.js --name turbo-capture
-pm2 save
-pm2 startup  # Follow instructions to enable auto-start
-```
-
-**Important Notes:**
-- **Chrome Installation**: When running without Docker, you MUST install Chrome with `npx puppeteer browsers install chrome`
-- **Docker Users**: If using Docker, Chrome is automatically installed during the build process
-- **System Requirements**: Minimum 512MB RAM, recommended 2GB+ for Chrome
-
-#### 2. Configure Nginx
-
-Add this location block to your nginx configuration **before** your existing `location /` block (order matters):
-
-```nginx
-# Permaweb Capture Backend Service
-location /local/capture/ {
-    # Route to backend on port 3001, stripping the /local/capture prefix
-    proxy_pass http://127.0.0.1:3001/;
-
-    # Preserve original request information
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-
-    # Required for proper HTTP/1.1 support
-    proxy_http_version 1.1;
-    proxy_set_header Connection "";
-
-    # Increase timeouts for screenshot processing (can take 30-90 seconds)
-    proxy_connect_timeout 120s;
-    proxy_send_timeout 120s;
-    proxy_read_timeout 120s;
-
-    # IMPORTANT: Do NOT add CORS headers here!
-    # The backend already handles CORS properly via the ALLOWED_ORIGINS env var.
-    # Adding headers here will cause duplicate header errors.
-}
-
-# Your existing ar.io gateway routing
-location / {
-    proxy_pass http://127.0.0.1:3000;
-    # ... rest of your existing config
-}
-```
-
-#### 3. Test and Reload Nginx
-
-```bash
-# Test nginx configuration
-sudo nginx -t
-
-# Reload nginx
-sudo systemctl reload nginx
-
-# Test health endpoint
-curl https://yourdomain.com/local/capture/health
-```
-
-#### 4. Update Frontend Configuration
-
-In your frontend code (`src/lib/capture/orchestrator.ts`), update the backend URLs:
-
-```typescript
-// Change from localhost to your domain
-const healthCheck = await fetch('https://yourdomain.com/local/capture/health', {
-  signal: AbortSignal.timeout(2000),
-});
-
-const screenshotResponse = await fetch('https://yourdomain.com/local/capture/screenshot', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({ url, waitFor: 5000 }),
-});
-```
-
-#### How it works:
-
-- `https://yourdomain.com/local/capture/screenshot` → Routes to `http://127.0.0.1:3001/screenshot`
-- `https://yourdomain.com/local/capture/health` → Routes to `http://127.0.0.1:3001/health`
-- `https://yourdomain.com/*` → Routes to your ar.io gateway on port 3000
-
-The `/local/capture` prefix ensures no conflicts with ar.io gateway paths.
-
-### Railway / Render / Heroku
-
-1. Connect your git repository
-2. Set `Dockerfile` as build method
-3. Set port to `3001`
-4. Deploy!
-
-### AWS ECS / Cloud Run / Azure Container Apps
-
-1. Build and push Docker image to registry
-2. Deploy container with 2GB RAM minimum
-3. Expose port 3001
-4. Configure auto-scaling based on CPU/memory
-
-### Important Notes
-
-- Chrome requires significant RAM (minimum 512MB, recommend 2GB)
-- Set appropriate resource limits to prevent memory issues
-- Rate limiting is already configured at 3 requests/minute per IP
-- Use PM2 or systemd for process management in production
-- Monitor logs for errors: `pm2 logs turbo-capture` or `journalctl -u turbo-capture`
-
-## Environment Variables
-
-- `PORT` - Server port (default: 3001)
-- `NODE_ENV` - Environment mode (development/production)
+Integration tests resolve fake `*.public.test` names to addresses classed as public
+and route them to a fixture server on 127.0.0.1 through resolver/dialer hooks that
+exist only as `createApp()` arguments; `server.js` never passes them, and no
+environment variable or request field can enable them.
 
 ## License
 
-MIT
+AGPL-3.0
